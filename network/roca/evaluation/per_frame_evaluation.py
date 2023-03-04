@@ -17,8 +17,8 @@ from detectron2.structures import Boxes, BoxMode, pairwise_iou
 from roca.data import CADCatalog, CategoryCatalog
 from roca.modeling.loss_functions import masked_l1_loss
 from roca.structures import Depths
-from roca.utils.ap import compute_ap
-
+from roca.utils.ap import compute_ap, compare_meshes
+from pytorch3d.structures.meshes import Meshes
 
 class InstanceEvaluator(DatasetEvaluator):
     def __init__(self, dataset_name: str, cfg, thresh=0.5):
@@ -78,7 +78,8 @@ class InstanceEvaluator(DatasetEvaluator):
             scores, labels = map(torch.as_tensor, map(list, (scores, labels)))
             npos = sum(v['npos'] for v in ap_values)
             gAPs[f] = np.round(
-                compute_ap(scores, labels, npos).item() * 100,
+                # compute_ap(scores, labels, npos).item() * 100,
+                compute_ap(scores, labels, npos) * 100,
                 decimals=2
             ).item()
 
@@ -90,7 +91,10 @@ class InstanceEvaluator(DatasetEvaluator):
                     torch.as_tensor(ap_data['scores']),
                     torch.as_tensor(ap_data['labels']),
                     ap_data['npos']
-                ).item()
+                )#.item()
+                # print(type(ap_dict[cat]))
+                # print(ap_dict[cat])
+                # exit()
 
         # Average and report category APs
         mAPs = {}
@@ -265,6 +269,17 @@ class InstanceEvaluator(DatasetEvaluator):
 
             fields = ['box', 'mask']
             field_ious = [box_ious, mask_ious]
+            # fields = ['box']
+            # field_ious = [box_ious]
+
+            # pvs = [e.vertices for e in self._train_cad_manager.models_by_ids([p['wild_cad_id'] for p in preds])]
+            # pfs = [e.faces for e in self._train_cad_manager.models_by_ids([p['wild_cad_id'] for p in preds])]
+            # gtvs = [e.vertices for e in self._train_cad_manager.models_by_ids([p['scene_cad_id'] for p in preds])]
+            # gtfs = [e.faces for e in self._train_cad_manager.models_by_ids([p['scene_cad_id'] for p in preds])]
+            # pred_meshes = Meshes(pvs, pfs)
+            # gt_meshes = Meshes(gtvs, gtfs)
+            # pred_meshes = [p['wild_cad_id'] for p in preds]
+            # gt_meshes = [p['scene_cad_id'] for p in preds]
 
             # Collect AP labels and scores
             for field, ious in zip(fields, field_ious):

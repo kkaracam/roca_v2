@@ -24,7 +24,7 @@ def parse_args(args=None):
     parser.add_argument('--max_iter', default=80000, type=int)
     parser.add_argument('--batch_size', default=4, type=int)
     parser.add_argument('--num_proposals', default=128, type=int)
-    parser.add_argument('--eval_period', default=2500, type=int)
+    parser.add_argument('--eval_period', default=5000, type=int)
     parser.add_argument(
         '--freq_scale', choices=['none', 'image', 'cad'], default='image'
     )
@@ -50,6 +50,7 @@ def parse_args(args=None):
     parser.add_argument('--zero_center', default=0, type=int)
     parser.add_argument('--irls_iters', default=1, type=int)
     parser.add_argument('--retrieval_mode', default='resnet_resnet+image+comp')
+    parser.add_argument('--retrieval_loss', default='triplet')
     parser.add_argument('--wild_retrieval', type=int, default=0)
     parser.add_argument('--confidence_thresh_test', type=float, default=0.5)
     parser.add_argument('--e2e', type=int, default=1)
@@ -125,6 +126,7 @@ def make_config(train_name, val_name, args):
         zero_center=bool(args.zero_center),
         irls_iters=args.irls_iters,
         retrieval_mode=args.retrieval_mode,
+        retrieval_loss=args.retrieval_loss,
         wild_retrieval=bool(args.wild_retrieval),
         confidence_thresh_test=args.confidence_thresh_test,
         e2e=bool(args.e2e)

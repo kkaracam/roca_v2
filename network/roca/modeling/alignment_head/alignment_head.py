@@ -31,6 +31,8 @@ from roca.modeling.loss_functions import (
     smooth_l1_loss,
 )
 from roca.modeling.retrieval_head import RetrievalHead
+from roca.modeling.retrieval_head.joint_retrieve_deform_head import JointRetriveDeformHead
+from roca.modeling.retrieval_head.joint_e2e import JointE2EHead
 from roca.structures import (
     Depths,
     Intrinsics,
@@ -119,7 +121,9 @@ class AlignmentHead(nn.Module):
             )
 
         # Initialize the retrieval head
-        self.retrieval_head = RetrievalHead(cfg, shape_code_size)
+        # self.retrieval_head = RetrievalHead(cfg, shape_code_size)
+        # self.retrieval_head = JointRetriveDeformHead(cfg)
+        self.retrieval_head = JointE2EHead(cfg, shape_code_size)
         self.wild_retrieval = cfg.MODEL.WILD_RETRIEVAL_ON
 
     @property
@@ -229,6 +233,13 @@ class AlignmentHead(nn.Module):
         losses.update(proc_losses)
 
         # Retrieval
+        # print((nocs!=0).any(1,keepdim=True)[0].sum())
+        # print(mask_pred.shape)
+        # print(mask_pred[0].sum())
+        # print((nn.functional.interpolate(nocs, scale_factor=3, mode='bilinear', align_corners=False)!=0).any(1,keepdim=True)[0].sum())
+        # print(instances)
+        # exit()
+        # print(shape_code.shape)
         losses.update(self._forward_retrieval_train(
             instances,
             mask_pred,
@@ -324,7 +335,7 @@ class AlignmentHead(nn.Module):
         predictions['pred_rotations'] = pred_rots
 
         if pred_nocs is not None:
-            pred_nocs *= (pred_mask_probs > 0.5)  # Keep all foreground NOCs!
+            pred_nocs *= (pred_mask_probs > 0.2)  # Keep all foreground NOCs!
 
         # Do the retrieval
         has_alignment = torch.ones(sum(instance_sizes), dtype=torch.bool)
@@ -749,22 +760,37 @@ class AlignmentHead(nn.Module):
 
     def _forward_retrieval_train(self, instances, mask, nocs, shape_code):
         losses = {}
+        # pos_cads = L.cat([p.gt_pos_cads for p in instances])
+        # neg_cads = L.cat([p.gt_neg_cads for p in instances])
+        # comp_loss, ret_loss = self.retrieval_head(
+        #     nocs,
+        #     mask,
+        #     pos_cads=pos_cads,
+        #     neg_cads=neg_cads
+        # )
+        # if comp_loss:
+        #     losses.update({'comp_loss':comp_loss, 'ret_loss':ret_loss})
+        # else:
+        #     losses.update({'ret_loss':ret_loss})
+        # print(losses)
+        # exit()
 
-        if not self.retrieval_head.baseline:
-            pos_cads = L.cat([p.gt_pos_cads for p in instances])
-            neg_cads = L.cat([p.gt_neg_cads for p in instances])
+        # if not self.retrieval_head.baseline:
+        pos_cads = L.cat([p.gt_pos_cads for p in instances])
+        neg_cads = L.cat([p.gt_neg_cads for p in instances])
 
-            # TODO: make this configurable
-            sample = torch.randperm(pos_cads.size(0))[:32]
+        # TODO: make this configurable
+        sample = torch.randperm(pos_cads.size(0))[:32]
 
-            losses.update(self.retrieval_head(
-                masks=mask[sample],
-                noc_points=nocs[sample],
-                shape_code=shape_code[sample],
-                pos_cads=pos_cads[sample],
-                neg_cads=neg_cads[sample]
-            ))
-
+        a = self.retrieval_head(
+            masks=mask[sample],
+            noc_points=nocs[sample],
+            shape_code=shape_code[sample],
+            pos_cads=pos_cads[sample],
+            neg_cads=neg_cads[sample]
+        )
+        losses.update(a)
+        
         return losses
 
     def _forward_retrieval_inference(
@@ -800,29 +826,54 @@ class AlignmentHead(nn.Module):
                     pred_transes
                 )
 
-            cad_ids, pred_indices = self.retrieval_head(
+            # cad_ids, pred_indices = self.retrieval_head(
+            #     scenes=scenes,
+            #     instance_sizes=instance_sizes,
+            #     has_alignment=has_alignment,
+            #     classes=pred_classes,
+            #     masks=pred_masks,
+            #     noc_points=noc_points,
+            #     shape_code=shape_code
+            # )
+            cad_ids, pred_indices, params, idx, nocs_comp = self.retrieval_head(
+                classes=pred_classes,
+                masks=pred_masks,
+                noc_points=noc_points,
                 scenes=scenes,
                 instance_sizes=instance_sizes,
                 has_alignment=has_alignment,
-                classes=pred_classes,
-                masks=pred_masks,
-                noc_points=noc_points,
                 shape_code=shape_code
             )
             extra_outputs['cad_ids'] = cad_ids
+            extra_outputs['pred_params'] = params
+            extra_outputs['joint_idx'] = idx
+            # assert noc_points.shape[0] == nocs_comp.shape[0]
+            extra_outputs['nocs_comp'] = nocs_comp
             predictions['pred_indices'] = pred_indices
 
         if self.wild_retrieval:
-            wild_cad_ids, wild_pred_indices = self.retrieval_head(
-                scenes=scenes,
-                instance_sizes=instance_sizes,
+            # wild_cad_ids, wild_pred_indices = self.retrieval_head(
+            #     scenes=scenes,
+            #     instance_sizes=instance_sizes,
+            #     classes=pred_classes,
+            #     masks=pred_masks,
+            #     noc_points=noc_points,
+            #     wild_retrieval=self.wild_retrieval,
+            #     shape_code=shape_code
+            # )
+            # extra_outputs['wild_cad_ids'] = wild_cad_ids
+            # predictions['pred_wild_indices'] = wild_pred_indices
+            cad_ids, pred_indices, params, idx = self.retrieval_head(
                 classes=pred_classes,
                 masks=pred_masks,
                 noc_points=noc_points,
-                wild_retrieval=self.wild_retrieval,
-                shape_code=shape_code
+                scenes=scenes,
+                instance_sizes=instance_sizes,
+                has_alignment=has_alignment
             )
-            extra_outputs['wild_cad_ids'] = wild_cad_ids
-            predictions['pred_wild_indices'] = wild_pred_indices
+            extra_outputs['wild_cad_ids'] = cad_ids
+            extra_outputs['pred_wild_params'] = params
+            extra_outputs['wild_joint_idx'] = idx
+            predictions['pred_wild_indices'] = pred_indices
 
         return predictions, extra_outputs

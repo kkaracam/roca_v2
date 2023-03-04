@@ -50,6 +50,7 @@ def roca_config(
     wild_retrieval: bool = True,
     # retrieval_mode: str = 'nearest'
     retrieval_mode: str = 'resnet_resnet+image+comp',
+    retrieval_loss: str = 'triplet',
     confidence_thresh_test: float = 0.5,
     e2e: bool = True
 ):
@@ -122,6 +123,10 @@ def roca_config(
     cfg.MODEL.WILD_RETRIEVAL_ON = wild_retrieval
     cfg.MODEL.RETRIEVAL_MODE = retrieval_mode
     cfg.MODEL.RETRIEVAL_BASELINE = _is_baseline(retrieval_mode)
+    cfg.MODEL.RETRIEVAL_LOSS = retrieval_loss
+    cfg.JOINT_BASE_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/'
+    cfg.JOINT_SRC_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/data/roca_sources_part_thresh_32_1024p_v1/chair/h5'
+    cfg.JOINT_MODEL_PATH = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/log/chair522_1024p_v1_icp/model.pth'
 
     # Set optimizer configuration
     cfg.SOLVER.STEPS = tuple(steps)

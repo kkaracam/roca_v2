@@ -85,10 +85,11 @@ class _RetrievalNetwork(nn.Module, abc.ABC):
 
 
 class PointNet(_RetrievalNetwork):
-    def __init__(self, relu_out=True, feat_trs=True, ret_trs=False):
+    def __init__(self, relu_out=True, feat_trs=True, ret_trs=False, fc_out=False):
         super().__init__()
 
         self.relu_out = relu_out
+        self.fc_out = fc_out
         self.feat_trs = feat_trs
         self.ret_trs = ret_trs
 
@@ -100,6 +101,7 @@ class PointNet(_RetrievalNetwork):
     
         if self.feat_trs:
             self.fstn = STN3d(k=64)
+        self.fc = nn.Linear(1024, 256)
 
     @property
     def embedding_dim(self):
@@ -131,6 +133,8 @@ class PointNet(_RetrievalNetwork):
 
         if self.relu_out:
             x = F.relu_(x)
+        if self.fc_out:
+            x = self.fc(x)
 
         return (x, trs, ftrs) if self.ret_trs else x
 

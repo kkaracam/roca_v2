@@ -14,6 +14,7 @@ def random_retrieval(cad_points: Tensor) -> Tuple[int, float]:
         size=(1,)
     )[0]
     distance = Tensor(1.0, device=cad_points.device)
+    # distance = Tensor([1.0]).to(cad_points.device)
     return index, distance
 
 

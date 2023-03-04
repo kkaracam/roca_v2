@@ -168,7 +168,8 @@ class Trainer(DefaultTrainer):
             cfg,
             output_dir=cfg.OUTPUT_DIR,
             exact_ret=True,
-            key_prefix='retrieval_'
+            key_prefix='retrieval_',
+            src_info=v2c_eval.source_info
         )
         ap_eval = InstanceEvaluator(dataset_name, cfg)
         depth_eval = DepthEvaluator(dataset_name, cfg)

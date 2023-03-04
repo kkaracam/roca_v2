@@ -181,6 +181,7 @@ class Mapper(DatasetMapper):
         scene_dir = os.path.join(self._metadata.rendering_root, scene_name)
         image_name = image_name + '.png'
 
+        # instance_path = os.path.join(scene_dir, 'instance-filt', image_name)
         instance_path = os.path.join(scene_dir, 'instance', image_name)
         depth_path = os.path.join(scene_dir, 'depth', image_name)
 

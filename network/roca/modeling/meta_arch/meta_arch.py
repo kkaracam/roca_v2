@@ -153,6 +153,17 @@ class ROCA(GeneralizedRCNN):
                 # indices are global, so all instances should have all CAD ids
                 for result in results:
                     result[cad_ids] = extra_outputs[cad_ids]
+        if 'pred_params' in extra_outputs:
+            for result in results:
+                # print("Meta Line 158: ", result)
+                # print("Meta Line 159: ", extra_outputs)
+                result['pred_params'] = extra_outputs['pred_params']
+        if 'joint_idx' in extra_outputs:
+            for result in results:
+                result['joint_idx'] = extra_outputs['joint_idx']
+        if 'nocs_comp' in extra_outputs:
+            for result in results:
+                result['nocs_comp'] = extra_outputs['nocs_comp']
 
         return results
 

@@ -41,6 +41,7 @@ class ROCAROIHeads(StandardROIHeads):
     def _init_class_weights(self, cfg):
         class_weights = cfg.MODEL.CLASS_SCALES
         self.use_class_weights = bool(class_weights)
+        # self.use_class_weights = False
         if self.use_class_weights:
             class_weight_tensor = torch.zeros(1 + len(class_weights))
             for i, scale in class_weights:

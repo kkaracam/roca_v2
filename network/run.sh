@@ -20,5 +20,7 @@ python main.py \
     --wild_retrieval 0 \
     --steps 60000 \
     --retrieval_mode $RETRIEVAL_MODE \
+    --retrieval_loss $RETRIEVAL_LOSS \
     --e2e $E2E \
-    --seed $SEED
+    --seed $SEED \
+    --batch_size 2
