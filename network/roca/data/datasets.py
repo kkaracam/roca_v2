@@ -33,7 +33,7 @@ def register_scan2cad(
     # )
     cad_file = os.path.join(data_dir, 'scan2cad_{}_cads.pkl'.format(split))
     category_file = os.path.join(data_dir, 'scan2cad_alignment_classes.json')
-    point_file = os.path.join(data_dir, 'points_{}_v1.pkl'.format(split))
+    point_file = os.path.join(data_dir, 'points_{}.pkl'.format(split))
     if not os.path.isfile(point_file):
         point_file = None if split == 'train' else 'assets/points_val.pkl'
     grid_file = os.path.join(data_dir, '{}_grids_32.pkl'.format(split))

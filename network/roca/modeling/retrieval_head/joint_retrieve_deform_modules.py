@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch_cluster import fps
 
 class STN3D(nn.Module):
     def __init__(self, input_channels=3):
@@ -75,6 +76,53 @@ class TargetEncoder(nn.Module):
         x = self.mlp1(x)
         x = self.mlp2(x)
         x = F.max_pool1d(x, num_points).squeeze(2)  # max pooling
+        x = self.fc(x)
+        return x
+
+class TargetEncoder2(nn.Module):
+    def __init__(self, embedding_size, input_channels=3):
+        super(TargetEncoder2, self).__init__()
+        self.input_channels = input_channels
+        self.stn1 = STN3D(input_channels)
+        self.stn2 = STN3D(64)
+        self.mlp1 = nn.Sequential(
+            nn.Conv1d(input_channels, 64, 1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 64, 1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+        )
+        self.mlp2 = nn.Sequential(
+            nn.Conv1d(64, 64, 1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 128, 1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Conv1d(128, 1024, 1),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(),
+        )
+        self.fc = nn.Linear(1024*3, embedding_size)
+
+    def forward(self, x1):
+        x2 = torch.stack([_x[fps(_x, ratio=0.25)] for _x in x1])
+        x3 = torch.stack([_x[fps(_x, ratio=0.25)] for _x in x2])
+        
+        out = []
+        for x in (x1,x2,x3):
+            batch_size = x.shape[0]
+            num_points = x.shape[1]
+
+            x = x[:, :, : self.input_channels]
+            x = x.transpose(2, 1)  # transpose to apply 1D convolution
+            x = self.mlp1(x)
+            x = self.mlp2(x)
+
+            x = F.max_pool1d(x, num_points).squeeze(2)  # max pooling
+            out.append(x)
+        x = torch.cat(out,dim=-1)
         x = self.fc(x)
         return x
 

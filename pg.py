@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 import sys
 import pickle
 import numpy as np
@@ -28,6 +28,7 @@ from network.roca.modeling.retrieval_head.joint_retrieve_deform_ops import (
 )
 from network.roca.modeling.retrieval_head.joint_retrieve_deform_modules import (
     TargetEncoder,
+    TargetEncoder2,
     TargetDecoder,
     ParamDecoder2
 )
@@ -315,7 +316,7 @@ def make_mock_instances(split='val'):
     with open(f'/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/scan2cad_instances_{split}_mock.json', 'w') as f:
         json.dump(mock_ins, f)
 
-def process_top5_gt(oracle_retrieval=False):
+def compare_ious(oracle_retrieval=False):
     def get_source_latent_codes_encoder(source_labels, SOURCE_MODEL_INFO, retrieval_encoder, device):
         # print("Using encoder to get source latent codes.")
         source_points = []
@@ -336,7 +337,7 @@ def process_top5_gt(oracle_retrieval=False):
 
     JOINT_BASE_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/'
     JOINT_SRC_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/data/roca_sources_part_thresh_32_1024p_v1/chair/h5'
-    JOINT_MODEL_PATH = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/log/chair522_partial/model.pth'
+    JOINT_MODEL_PATH = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/log/chair522_1024p_v1_icp/model.pth'
     filename_pickle = JOINT_BASE_DIR+"data/generated_datasplits/chair_522_roca_v1.pickle"
     with open(filename_pickle, 'rb') as handle:
         sources = pickle.load(handle)['sources']
@@ -473,15 +474,6 @@ def process_top5_gt(oracle_retrieval=False):
         tar_pc = torch.from_numpy(tar_pc).unsqueeze(0).to(device, dtype=torch.float)
         tar_pc.requires_grad = False
 
-        x_part = tar_pc.clone()
-        for _x in x_part:
-            rnd_axis = torch.randint(3,(1,))
-            rnd_gl = torch.randint(2,(1,))
-
-            if rnd_gl == 0:
-                _x = _x[(_x[:,rnd_axis] < 0).squeeze(-1),:]
-            else:
-                _x = _x[(_x[:,rnd_axis] > 0).squeeze(-1),:]
         # assert tar_pc.shape == (1,1024,3)
         
         if oracle_retrieval:
@@ -533,7 +525,7 @@ def process_top5_gt(oracle_retrieval=False):
             )
         
         else:
-            retrieval_latent_codes = retrieval_encoder(x_part)
+            retrieval_latent_codes = retrieval_encoder(tar_pc)
             retrieval_latent_codes = retrieval_latent_codes.unsqueeze(0).repeat(len(SOURCE_MODEL_INFO),1,1)
             # retrieval_latent_codes = retrieval_latent_codes.view(-1, retrieval_latent_codes.shape[-1])	
             retrieval_latent_codes = retrieval_latent_codes.view(len(SOURCE_MODEL_INFO), -1, TARGET_LATENT_DIM)
@@ -548,7 +540,7 @@ def process_top5_gt(oracle_retrieval=False):
             sorted_indices = torch.argsort(distances, dim=0)
             retrieved_idx = sorted_indices[0,:]
 
-            target_latent_codes = target_encoder(x_part)
+            target_latent_codes = target_encoder(tar_pc)
             concat_latent_code = torch.cat((src_latent_codes[retrieved_idx], target_latent_codes), dim=1)
 
             curr_num_parts = SOURCE_MODEL_INFO[retrieved_idx]["num_parts"]
@@ -576,11 +568,13 @@ def process_top5_gt(oracle_retrieval=False):
                 vertices=output_vertices,
                 faces=SOURCE_MODEL_INFO[retrieved_idx[0]]["faces"]
             )
-        mesh.vertices = mesh.vertices + (center - centroid) / np.linalg.norm(diag)
+        # mesh.vertices = mesh.vertices + (center - centroid) / np.linalg.norm(diag)
         pred_ind = voxelize_mesh(mesh)
+        gt_mesh = trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v1/03001627/{model_id}/model.obj", force='mesh')
+        gt_ind = voxelize_mesh(gt_mesh.apply_transform(trimesh.transformations.euler_matrix(0, np.pi/2,0)))
 
-        gt_ind = \
-            grids_val[cat_id, model_id]
+        # gt_ind = \
+        #     grids_val[cat_id, model_id]
         
         pred_ind_1d = np.unique(np.ravel_multi_index(
             multi_index=(pred_ind[:, 0], pred_ind[:, 1], pred_ind[:, 2]),
@@ -606,6 +600,132 @@ def process_top5_gt(oracle_retrieval=False):
     return ious
     # with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/scan2cad_val_top5_ret.json', 'w') as t5f:
     #     json.dump(top5_gt, t5f)
+def process_top5_gt():
+    def get_source_latent_codes_encoder(source_labels, SOURCE_MODEL_INFO, retrieval_encoder, device):
+        # print("Using encoder to get source latent codes.")
+        source_points = []
+
+        # start_tm = time.time()
+        for source_label in source_labels:
+            src_points = SOURCE_MODEL_INFO[source_label]["points"]	
+            source_points.append(src_points)
+        # ret_tm = time.time()
+        # print("Load from labels time: ", ret_tm - start_tm)
+        # print("Num labels: ", source_labels.shape)
+        source_points = np.array(source_points)
+        source_points = torch.from_numpy(source_points).to(device, dtype=torch.float)
+
+        src_latent_codes = retrieval_encoder(source_points)
+        # print("Retrieval encoding time: ", time.time() - ret_tm)
+        return src_latent_codes
+
+    JOINT_BASE_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/'
+    JOINT_SRC_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/data/roca_sources_part_thresh_32_1024p_v2/chair/h5'
+    JOINT_MODEL_PATH = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/log/chair519_1024p_v2/model.pth'
+    filename_pickle = JOINT_BASE_DIR+"data/generated_datasplits/chair_519_roca_v2.pickle"
+    with open(filename_pickle, 'rb') as handle:
+        sources = pickle.load(handle)['sources']
+    src_data_fol = JOINT_SRC_DIR
+
+    device = 'cuda'
+    SOURCE_MODEL_INFO = []
+    print("Loading joint sources...")
+    with open("/home/karacam/Thesis/joint_learning_retrieval_deformation/shape2part_ext.json", 'r') as f:
+        shape2part = json.load(f)
+    part2shape = dict([(value, key) for key, value in shape2part['chair']['model_names'].items()])
+
+    for i in range(len(sources)):
+        source_model = sources[i]
+        src_filename = str(source_model) + "_leaves.h5"
+
+        default_param, points, point_labels, points_mat, \
+                        constraint_mat,	constraint_proj_mat	= get_model(src_data_fol + '/' + src_filename, constraint=True)
+
+        curr_source_dict = {}
+        curr_source_dict["default_param"] = default_param
+        curr_source_dict["points"] = points
+        curr_source_dict["point_labels"] = point_labels
+        curr_source_dict["points_mat"] = points_mat
+        curr_source_dict["model_id"] = (shape2part['chair']['synsetid'], part2shape[str(source_model)])
+
+        curr_source_dict["constraint_mat"] = constraint_mat
+        curr_source_dict["constraint_proj_mat"] = constraint_proj_mat
+
+        # Get number of parts of the model
+        num_parts = len(np.unique(point_labels))
+        curr_source_dict["num_parts"] = num_parts
+
+        SOURCE_MODEL_INFO.append(curr_source_dict)
+    print("Done loading joint sources.")
+    TARGET_LATENT_DIM = 256
+    SOURCE_LATENT_DIM = 256
+    # with torch.no_grad():
+
+    # param_decoder.to(device, dtype=torch.float)
+    retrieval_encoder = TargetEncoder(
+        TARGET_LATENT_DIM,
+        3,
+    )
+    # embed_loss = nn.TripletMarginLoss(margin=MARGIN)
+
+    _model = torch.load(JOINT_MODEL_PATH)
+
+    retrieval_encoder.load_state_dict(_model["retrieval_encoder"])
+    retrieval_encoder.to(device)
+    retrieval_encoder.eval()
+
+    SOURCE_VARIANCES = _model["source_variances"].detach()
+
+    source_labels = torch.arange(len(SOURCE_MODEL_INFO))#.repeat(10)
+
+
+    with torch.no_grad():
+        ret_src_latent_codes = []
+        num_sets = 20
+        interval = int(len(source_labels)/num_sets)
+
+        for j in range(num_sets):
+            if (j==num_sets-1):
+                curr_src_latent_codes = get_source_latent_codes_encoder(source_labels[j*interval:], SOURCE_MODEL_INFO, retrieval_encoder, device)
+            else:
+                curr_src_latent_codes = get_source_latent_codes_encoder(source_labels[j*interval:(j+1)*interval], SOURCE_MODEL_INFO, retrieval_encoder, device)
+            ret_src_latent_codes.append(curr_src_latent_codes)
+
+        ret_src_latent_codes = torch.cat(ret_src_latent_codes)
+    
+    with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/points_val.pkl', 'rb') as f:
+        points_val = pickle.load(f)
+    top5_gt = {s['id_cad']:[] for s in points_val}
+
+    assert len({ps['id_cad'] for ps in points_val}) == len(points_val)
+    tar_pcs = {(ps['catid_cad'],ps['id_cad']):ps['points'] for ps in points_val}
+
+    for cat_id, model_id in tqdm(tar_pcs):
+        # tar_pc_np = mesh.sample(1024)
+        tar_pc = tar_pcs[cat_id, model_id]
+        tar_pc = torch.from_numpy(tar_pc).unsqueeze(0).to(device, dtype=torch.float)
+        tar_pc.requires_grad = False
+
+        assert tar_pc.shape == (1,1024,3)
+        
+        retrieval_latent_codes = retrieval_encoder(tar_pc)
+        retrieval_latent_codes = retrieval_latent_codes.unsqueeze(0).repeat(len(SOURCE_MODEL_INFO),1,1)
+        # retrieval_latent_codes = retrieval_latent_codes.view(-1, retrieval_latent_codes.shape[-1])	
+        retrieval_latent_codes = retrieval_latent_codes.view(len(SOURCE_MODEL_INFO), -1, TARGET_LATENT_DIM)
+        with torch.no_grad():
+            source_labels = source_labels
+            _src_latent_codes = ret_src_latent_codes.view(len(SOURCE_MODEL_INFO), -1, SOURCE_LATENT_DIM)
+
+            src_variances = get_source_latent_codes_fixed(source_labels, SOURCE_VARIANCES, device=device)
+            src_variances = src_variances.view(len(SOURCE_MODEL_INFO), -1, SOURCE_LATENT_DIM)
+
+        distances = compute_mahalanobis(retrieval_latent_codes, _src_latent_codes, src_variances, activation_fn=torch.sigmoid)
+        sorted_indices = torch.argsort(distances, dim=0)
+        retrieved_idx = sorted_indices[5,:]
+        top5_gt[model_id] = [SOURCE_MODEL_INFO[k]['model_id'][1] for k in retrieved_idx]
+
+    with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/scan2cad_val_top5_ret.json', 'w') as t5f:
+        json.dump(top5_gt, t5f)
 
 def get_source_info_mesh(points_mat, default_param, constraint_proj_mat, max_num_params, use_connectivity=True):
     padded_mat = np.zeros((points_mat.shape[0], max_num_params))
@@ -671,9 +791,10 @@ def create_grid_points_from_xyz_bounds(min_x, max_x, min_y, max_y ,min_z, max_z,
     del X, Y, Z, x
     return points_list
 
-with torch.no_grad():
-    ious = process_top5_gt(oracle_retrieval=False)
+# with torch.no_grad():
+#     ious = compare_ious()
 # proccess_annotations()
 # process_400k_custom(split='val')
 # joint_input_data(split='val')
 # make_mock_instances(split='val')
+process_top5_gt()

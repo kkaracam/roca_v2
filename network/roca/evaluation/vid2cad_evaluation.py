@@ -161,12 +161,11 @@ class Vid2CADEvaluator(DatasetEvaluator):
         self.exact_ret = exact_ret
         self.key_prefix = key_prefix
         self.info_file = info_file
-        JOINT_BASE_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/'
-        JOINT_SRC_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/data/roca_sources_part_thresh_32_1024p_v1/chair/h5'
-        filename_pickle = JOINT_BASE_DIR+"data/generated_datasplits/chair_522_roca_v1.pickle"
+
+        filename_pickle = cfg.JOINT_SRC_PKL
         with open(filename_pickle, 'rb') as handle:
             sources = pkl.load(handle)['sources']
-        self.src_data_fol = JOINT_SRC_DIR
+        self.src_data_fol = cfg.JOINT_SRC_DIR
         with open("/home/karacam/Thesis/joint_learning_retrieval_deformation/shape2part_ext.json", 'r') as f:
             self.shape2part = json.load(f)
         part2shape = dict([(value, key) for key, value in self.shape2part['chair']['model_names'].items()])
@@ -174,18 +173,18 @@ class Vid2CADEvaluator(DatasetEvaluator):
         self._metas = {}
         with open(f"/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/train_grids_32.pkl", 'rb') as f:
             self.train_grids = pkl.load(f)
-        print("Loading source mesh info...")
-        if not src_info:
-            for src in sources:
-                src_filename = str(src) + "_leaves.h5"
-                shapeid = part2shape[str(src)]
-                self.source_info[shapeid] = (get_model(os.path.join(self.src_data_fol, src_filename), pred=True))
-                with open(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{shapeid}/models/model_normalized.json", 'r') as jf:
-                    _meta = json.load(jf)
-                self._metas[shapeid] = _meta
-        else:
-            self.source_info = src_info
-        print("Done.")
+        # print("Loading source mesh info...")
+        # if not src_info:
+        #     for src in sources:
+        #         src_filename = str(src) + "_leaves.h5"
+        #         shapeid = part2shape[str(src)]
+        #         self.source_info[shapeid] = (get_model(os.path.join(self.src_data_fol, src_filename), pred=True))
+        #         with open(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{shapeid}/models/model_normalized.json", 'r') as jf:
+        #             _meta = json.load(jf)
+        #         self._metas[shapeid] = _meta
+        # else:
+        #     self.source_info = src_info
+        # print("Done.")
         self.noc_tar_trip = []
 
     def reset(self):
@@ -224,16 +223,18 @@ class Vid2CADEvaluator(DatasetEvaluator):
                     object_ids[i]
                     for i in instances.pred_indices.tolist()
                 ]
+                self.object_ids[scene_name].append(object_ids)
+            if 'pred_params' in output:
                 object_params = [
                     output['pred_params'][i].cpu().numpy()
                     for i in instances.pred_indices.tolist()
                 ]
+                self.object_params[scene_name].append(object_params)
+            if 'nocs_comp' in output:
                 object_comps = [
                     output['nocs_comp'][i].cpu().numpy()
                     for i in instances.pred_indices.tolist()
                 ]
-                self.object_ids[scene_name].append(object_ids)
-                self.object_params[scene_name].append(object_params)
                 self.object_comps[scene_name].append(object_comps)
 
             pose_file = file_name\
@@ -296,16 +297,18 @@ class Vid2CADEvaluator(DatasetEvaluator):
             # so sort them similar to results
             if k in self.object_ids:
                 object_ids = []
-                object_params = []
-                object_comps = []
                 for ids in self.object_ids[k]:
                     object_ids.extend(ids)
+                self.object_ids[k] = [object_ids[i] for i in indices.tolist()]
+            if k in self.object_params:
+                object_params = []
                 for params in self.object_params[k]:
                     object_params.extend(params)
+                self.object_params[k] = [object_params[i] for i in indices.tolist()]
+            if k in self.object_comps:
+                object_comps = []
                 for comps in self.object_comps[k]:
                     object_comps.extend(comps)
-                self.object_ids[k] = [object_ids[i] for i in indices.tolist()]
-                self.object_params[k] = [object_params[i] for i in indices.tolist()]
                 self.object_comps[k] = [object_comps[i] for i in indices.tolist()]
 
     def _transform_results_to_world_space(self):
@@ -563,16 +566,18 @@ class Vid2CADEvaluator(DatasetEvaluator):
             pred_class = instances.pred_classes[i].item()
 
             object_ids = self.object_ids[scene]
-            object_params = self.object_params[scene]
-            object_comps = self.object_comps[scene]
+            if self.object_params:
+                object_params = self.object_params[scene]
+                pred_params = object_params[i]
+            if self.object_comps:
+                object_comps = self.object_comps[scene]
+                nocs_comp = object_comps[i]
             # if self.mocking:
             #     model_i = object_ids[instances.model_indices[i].item()]
             #     cat_i = pred_class
             #     pred_params = object_params[instances.model_indices[i].item()]
             # else:
             cat_i, model_i = object_ids[i]
-            pred_params = object_params[i]
-            nocs_comp = object_comps[i]
             try:
                 sym_i= next(
                     a['sym']
@@ -584,22 +589,24 @@ class Vid2CADEvaluator(DatasetEvaluator):
                 sym_i = "__SYM_NONE"
                 # print("StopIteration encountered")
             if not self.exact_ret:
-                default_param, vertices_mat, faces, constraint_proj_mat = (get_model(os.path.join(self.src_data_fol, str(self.shape2part['chair']['model_names'][str(model_i)])+'_leaves.h5'), pred=True))
-                default_param, vertices_mat, faces, constraint_proj_mat = self.source_info[model_i]
-                curr_param = np.expand_dims(pred_params, -1)
-                curr_mat, curr_default_param, curr_conn_mat = get_source_info_mesh(vertices_mat, default_param, constraint_proj_mat, curr_param.shape[0])
-                output_vertices = get_shape_numpy(curr_mat, curr_param, curr_default_param.T, connectivity_mat=curr_conn_mat)
-                mesh = trimesh.Trimesh(
-                    vertices=output_vertices,
-                    faces=faces
-                )
+                # default_param, vertices_mat, faces, constraint_proj_mat = (get_model(os.path.join(self.src_data_fol, str(self.shape2part['chair']['model_names'][str(model_i)])+'_leaves.h5'), pred=True))
+                # default_param, vertices_mat, faces, constraint_proj_mat = self.source_info[model_i]
+                # curr_param = np.expand_dims(pred_params, -1)
+                # curr_mat, curr_default_param, curr_conn_mat = get_source_info_mesh(vertices_mat, default_param, constraint_proj_mat, curr_param.shape[0])
+                # output_vertices = get_shape_numpy(curr_mat, curr_param, curr_default_param.T, connectivity_mat=curr_conn_mat)
+                # mesh = trimesh.Trimesh(
+                #     vertices=output_vertices,
+                #     faces=faces
+                # )
 
-                diag = np.asarray(self._metas[model_i]['max']) - np.asarray(self._metas[model_i]['min'])
-                center = (np.asarray(self._metas[model_i]['max']) + np.asarray(self._metas[model_i]['min']))/2
-                mesh.vertices = mesh.vertices + (center - np.asarray(self._metas[model_i]['centroid'])) / np.linalg.norm(diag)
-                pred_ind = voxelize_mesh(mesh)
+                # # diag = np.asarray(self._metas[model_i]['max']) - np.asarray(self._metas[model_i]['min'])
+                # # center = (np.asarray(self._metas[model_i]['max']) + np.asarray(self._metas[model_i]['min']))/2
+                # # mesh.vertices = mesh.vertices + (center - np.asarray(self._metas[model_i]['centroid'])) / np.linalg.norm(diag)
+                # pred_ind = voxelize_mesh(mesh)
                 
-                # pred_ind = self.train_grids[cat_i, model_i]
+                pred_ind = self.train_grids[cat_i, model_i]
+
+                # pred_ind = self.val_grid_data[cat_i, model_i]
             match = None
             for j, label in enumerate(labels):
                 if covered[j]:
@@ -623,7 +630,12 @@ class Vid2CADEvaluator(DatasetEvaluator):
                     and scale_ratio(pred_scale, gt_scale) <= SCALE_THRESH
                 )
                 # if is_correct and not self.exact_ret:
-                #     self.noc_tar_trip.append((mesh, nocs_comp[1], label['id_cad']))
+                #     mesh.export('tst_deformed.obj')
+                #     trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{model_i}/models/model_normalized.obj", force='mesh').export('tst_src.obj')
+                #     trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{label['id_cad']}/models/model_normalized.obj", force='mesh').export('tst_tar.obj')
+                #     trimesh.PointCloud(nocs_comp[1].T).export('tst_nocs.ply')
+                #     exit()
+                    # self.noc_tar_trip.append((mesh, nocs_comp[1], label['id_cad']))
                     
                 # for k, ret_label in enumerate(ret_labels):
                 #     if ret_covered[k]:
@@ -636,15 +648,16 @@ class Vid2CADEvaluator(DatasetEvaluator):
                 #     cad_gts = [(int(rl[0]), rl[1]) for rl in ret_label]
                 #     is_correct = is_correct and (cad_pred in cad_gts)
                 if self.exact_ret:
-                    cad_pred = (int(cat_i), model_i)
-                    cad_gt = (int(label['catid_cad']), label['id_cad'])
-                    is_correct = is_correct and cad_pred == cad_gt
+                    # cad_pred = (int(cat_i), model_i)
+                    # cad_gt = (int(label['catid_cad']), label['id_cad'])
+                    # is_correct = is_correct and cad_pred == cad_gt
+                    is_correct = is_correct and (model_i in self.ret_lookup[label['id_cad']])
                 # elif self.with_grids:
                 else:
                     try:
                         iou = self._voxel_iou(label, pred_ind)
                         # if iou >= 0.4:
-                        print(iou)
+                        # print(iou)
                         # print('Passed')
                     except KeyError:
                         iou = 0.0
@@ -861,6 +874,10 @@ def render_nocs(noc_trips):
         img = (img.detach().cpu().numpy()[0] * 255).astype('uint8')
 
         return img
+    
+    if not noc_trips:
+        print("List is empty, won't render!")
+        return
 
     device = 'cuda'
     renderer_params = {

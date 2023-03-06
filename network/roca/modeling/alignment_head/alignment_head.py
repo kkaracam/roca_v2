@@ -120,6 +120,7 @@ class AlignmentHead(nn.Module):
                 output_activation=nn.Sigmoid
             )
 
+        self.is_joint = "joint" in cfg.MODEL.RETRIEVAL_MODE
         # Initialize the retrieval head
         # self.retrieval_head = RetrievalHead(cfg, shape_code_size)
         # self.retrieval_head = JointRetriveDeformHead(cfg)
@@ -826,30 +827,34 @@ class AlignmentHead(nn.Module):
                     pred_transes
                 )
 
-            # cad_ids, pred_indices = self.retrieval_head(
-            #     scenes=scenes,
-            #     instance_sizes=instance_sizes,
-            #     has_alignment=has_alignment,
-            #     classes=pred_classes,
-            #     masks=pred_masks,
-            #     noc_points=noc_points,
-            #     shape_code=shape_code
-            # )
-            cad_ids, pred_indices, params, idx, nocs_comp = self.retrieval_head(
-                classes=pred_classes,
-                masks=pred_masks,
-                noc_points=noc_points,
-                scenes=scenes,
-                instance_sizes=instance_sizes,
-                has_alignment=has_alignment,
-                shape_code=shape_code
-            )
-            extra_outputs['cad_ids'] = cad_ids
-            extra_outputs['pred_params'] = params
-            extra_outputs['joint_idx'] = idx
-            # assert noc_points.shape[0] == nocs_comp.shape[0]
-            extra_outputs['nocs_comp'] = nocs_comp
-            predictions['pred_indices'] = pred_indices
+            if self.is_joint:
+                cad_ids, pred_indices, params, idx, nocs_comp = self.retrieval_head(
+                    classes=pred_classes,
+                    masks=pred_masks,
+                    noc_points=noc_points,
+                    scenes=scenes,
+                    instance_sizes=instance_sizes,
+                    has_alignment=has_alignment,
+                    shape_code=shape_code
+                )
+                extra_outputs['cad_ids'] = cad_ids
+                extra_outputs['pred_params'] = params
+                extra_outputs['joint_idx'] = idx
+                # assert noc_points.shape[0] == nocs_comp.shape[0]
+                extra_outputs['nocs_comp'] = nocs_comp
+                predictions['pred_indices'] = pred_indices
+            else:
+                cad_ids, pred_indices = self.retrieval_head(
+                    scenes=scenes,
+                    instance_sizes=instance_sizes,
+                    has_alignment=has_alignment,
+                    classes=pred_classes,
+                    masks=pred_masks,
+                    noc_points=noc_points,
+                    shape_code=shape_code
+                )
+                extra_outputs['cad_ids'] = cad_ids
+                predictions['pred_indices'] = pred_indices
 
         if self.wild_retrieval:
             # wild_cad_ids, wild_pred_indices = self.retrieval_head(

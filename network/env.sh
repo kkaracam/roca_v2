@@ -15,13 +15,13 @@ export RENDERING_ROOT=/mnt/noraid/karacam/Roca/Data/Rendering #/mnt/noraid/karac
 export FULL_ANNOT=/mnt/noraid/karacam/Roca/Data/full_annotations.json #$HOME/Thesis/ROCA/Data/full_annotations.json
 
 # Model configurations
-export RETRIEVAL_MODE="joint" #joint+comp, resnet_resnet+image+comp, nearest
+export RETRIEVAL_MODE="joint+e2e" #joint+comp, resnet_resnet+image+comp, nearest
 export RETRIEVAL_LOSS="triplet" #bce, triplet
 export E2E=1
 export NOC_WEIGHTS=1
 
 # Train and test behavior
-export EVAL_ONLY=1
-export CHECKPOINT="/mnt/noraid/karacam/Roca/roca_log/chair_joint_v1_icp/model_final.pth" #"/mnt/noraid/karacam/Roca/roca_log/chair_joint/model_final.pth"  # "none"
+export EVAL_ONLY=0
+export CHECKPOINT="none" #"/mnt/noraid/karacam/Roca/roca_log/chair_joint/model_final.pth"  # "none"
 export RESUME=0 # This means from last checkpoint
-export OUTPUT_DIR=/mnt/noraid/karacam/Roca/roca_log/chair_joint_v1_icp
+export OUTPUT_DIR=/mnt/noraid/karacam/Roca/roca_log/chair_joint_v2_e2e

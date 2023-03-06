@@ -192,3 +192,9 @@ def get_source_info(source_labels, source_model_info, max_num_params, use_connec
 		return source_mats, source_default_params, source_connectivity_mat
 	else:
 		return source_mats, source_default_params, None
+
+def get_symmetric(pc):
+
+	reflected_pc = torch.cat([-pc[:,:,0].unsqueeze(-1), pc[:,:,1].unsqueeze(-1), pc[:,:,2].unsqueeze(-1)], axis=2)
+
+	return reflected_pc
