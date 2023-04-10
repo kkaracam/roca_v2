@@ -51,6 +51,7 @@ def roca_config(
     # retrieval_mode: str = 'nearest'
     retrieval_mode: str = 'resnet_resnet+image+comp',
     retrieval_loss: str = 'triplet',
+    joint_model_path: str = '',
     confidence_thresh_test: float = 0.5,
     e2e: bool = True
 ):
@@ -125,9 +126,9 @@ def roca_config(
     cfg.MODEL.RETRIEVAL_BASELINE = _is_baseline(retrieval_mode)
     cfg.MODEL.RETRIEVAL_LOSS = retrieval_loss
     cfg.JOINT_BASE_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/'
-    cfg.JOINT_SRC_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/data/roca_sources_part_thresh_32_1024p_v2/chair/h5/'
-    cfg.JOINT_SRC_PKL = cfg.JOINT_BASE_DIR+"data/generated_datasplits/chair_519_roca_v2.pickle"
-    cfg.JOINT_MODEL_PATH = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/log/chair519_1024p_v2/model.pth'
+    cfg.JOINT_SRC_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/data/roca_sources_part_thresh_32_1024p_v1/chair/h5/'
+    cfg.JOINT_SRC_PKL = cfg.JOINT_BASE_DIR+"data/generated_datasplits/chair_522_roca.pickle"
+    cfg.JOINT_MODEL_PATH = joint_model_path
 
     # Set optimizer configuration
     cfg.SOLVER.STEPS = tuple(steps)

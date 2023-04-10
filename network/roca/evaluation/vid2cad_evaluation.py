@@ -23,9 +23,9 @@ import torch
 from pandas import DataFrame, read_csv
 from tabulate import tabulate
 import h5py
-import time
 from tqdm import tqdm
-import warnings
+from point_cloud_utils import pairwise_distances, sinkhorn, earth_movers_distance
+from roca.data import CADCatalog
 
 from detectron2.data import MetadataCatalog
 from detectron2.evaluation.evaluator import DatasetEvaluator
@@ -44,13 +44,13 @@ from roca.utils.alignment_errors import (
     translation_diff,
 )
 from roca.utils.linalg import decompose_mat4, make_M_from_tqs
+from roca.utils.ap import compare_meshes
 from roca.modeling.retrieval_head.joint_retrieve_deform_ops import get_model
 
 from PIL import Image
 from pytorch3d.io import load_obj
 from pytorch3d.structures import Meshes, Pointclouds
 # from pytorch3d.transforms import RotateAxisAngle
-import random
 from pytorch3d.renderer import(
     look_at_view_transform,
     FoVPerspectiveCameras,
@@ -66,9 +66,7 @@ from pytorch3d.renderer import(
     AlphaCompositor
 )
 
-import logging
-logger = logging.getLogger("pytorch3d")
-logger.setLevel(logging.ERROR)
+from torch_cluster import fps
 
 NMS_TRANS = 0.4
 NMS_ROT = 60
@@ -98,6 +96,8 @@ class Vid2CADEvaluator(DatasetEvaluator):
         self._dataset_name = dataset_name
         self._metadata = MetadataCatalog.get(self._dataset_name)
         self._category_manager = CategoryCatalog.get(self._dataset_name)
+        self.cad_manager = CADCatalog.get(dataset_name)
+        self.cad_manager_train = CADCatalog.get(cfg.DATASETS.TRAIN[0])
 
         self.mocking = mocking
         self._output_dir = output_dir
@@ -157,6 +157,9 @@ class Vid2CADEvaluator(DatasetEvaluator):
             self.train_grid_data = pkl.load(f)
         with open(self._metadata.val_grid_file, 'rb') as f:
             self.val_grid_data = pkl.load(f)
+        with open(self._metadata.point_file, 'rb') as f:
+            point_data = pkl.load(f)
+        self.point_data = {(p['catid_cad'], p['id_cad']): p['points'] for p in point_data}
 
         self.exact_ret = exact_ret
         self.key_prefix = key_prefix
@@ -418,10 +421,15 @@ class Vid2CADEvaluator(DatasetEvaluator):
                     sym = "__SYM_NONE"
                     # print("StopIteration encountered")
 
+                # is_dup = (
+                #     translation_diff(pred_trans[i], pred_trans[j]) <= NMS_TRANS
+                #     and scale_ratio(pred_scale[i], pred_scale[j]) <= NMS_SCALE
+                #     and rotation_diff(pred_rot[i], pred_rot[j], sym) <= NMS_ROT
+                # )
                 is_dup = (
                     translation_diff(pred_trans[i], pred_trans[j]) <= NMS_TRANS
                     and scale_ratio(pred_scale[i], pred_scale[j]) <= NMS_SCALE
-                    and rotation_diff(pred_rot[i], pred_rot[j], sym) <= NMS_ROT
+                    and rotation_diff(pred_rot[i], pred_rot[j]) <= NMS_ROT
                 )
                 if is_dup:
                     valid_map[j] = False
@@ -454,9 +462,7 @@ class Vid2CADEvaluator(DatasetEvaluator):
             corrects, counts = self._count_corrects(scene, instances)
             corrects_per_class.update(corrects)
             counts_per_class.update(counts)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            render_nocs(self.noc_tar_trip)
+        render_nocs(self.noc_tar_trip[:15])
 
         if self.info_file != '':
             print('Writing evaluation info to {}...'.format(self.info_file))
@@ -559,6 +565,8 @@ class Vid2CADEvaluator(DatasetEvaluator):
 
         corrects = Counter()
         covered = [False for _ in labels]
+        max_f1s = [-1. for _ in labels]
+        not_in_trains = [(l['catid_cad'], l['id_cad']) in set(self.train_grids.keys()) for l in labels]
         for i in range(len(instances)):
             pred_trans = instances.pred_translations[i]
             pred_rot = np.quaternion(*instances.pred_rotations[i].tolist())
@@ -578,35 +586,38 @@ class Vid2CADEvaluator(DatasetEvaluator):
             #     pred_params = object_params[instances.model_indices[i].item()]
             # else:
             cat_i, model_i = object_ids[i]
-            try:
-                sym_i= next(
-                    a['sym']
-                    for a in self._scene_alignments[scene]
-                    if int(a['catid_cad']) == int(cat_i)
-                    and a['id_cad'] == model_i
-                )
-            except StopIteration:
-                sym_i = "__SYM_NONE"
+            # try:
+            #     sym_i= next(
+            #         a['sym']
+            #         for a in self._scene_alignments[scene]
+            #         if int(a['catid_cad']) == int(cat_i)
+            #         and a['id_cad'] == model_i
+            #     )
+            # except StopIteration:
+            #     sym_i = "__SYM_NONE"
                 # print("StopIteration encountered")
             if not self.exact_ret:
-                # default_param, vertices_mat, faces, constraint_proj_mat = (get_model(os.path.join(self.src_data_fol, str(self.shape2part['chair']['model_names'][str(model_i)])+'_leaves.h5'), pred=True))
                 # default_param, vertices_mat, faces, constraint_proj_mat = self.source_info[model_i]
                 # curr_param = np.expand_dims(pred_params, -1)
                 # curr_mat, curr_default_param, curr_conn_mat = get_source_info_mesh(vertices_mat, default_param, constraint_proj_mat, curr_param.shape[0])
                 # output_vertices = get_shape_numpy(curr_mat, curr_param, curr_default_param.T, connectivity_mat=curr_conn_mat)
+                # pred_mesh = Meshes([torch.from_numpy(output_vertices).type(torch.float)], [torch.from_numpy(faces).type(torch.float)]).to('cuda')
                 # mesh = trimesh.Trimesh(
                 #     vertices=output_vertices,
                 #     faces=faces
                 # )
 
-                # # diag = np.asarray(self._metas[model_i]['max']) - np.asarray(self._metas[model_i]['min'])
-                # # center = (np.asarray(self._metas[model_i]['max']) + np.asarray(self._metas[model_i]['min']))/2
-                # # mesh.vertices = mesh.vertices + (center - np.asarray(self._metas[model_i]['centroid'])) / np.linalg.norm(diag)
+                # diag = np.asarray(self._metas[model_i]['max']) - np.asarray(self._metas[model_i]['min'])
+                # center = (np.asarray(self._metas[model_i]['max']) + np.asarray(self._metas[model_i]['min']))/2
+                # mesh.vertices = mesh.vertices + (center - np.asarray(self._metas[model_i]['centroid'])) / np.linalg.norm(diag)
                 # pred_ind = voxelize_mesh(mesh)
                 
-                pred_ind = self.train_grids[cat_i, model_i]
-
+                pred_mesh = self.cad_manager_train.model_by_id(cat_i, model_i).to('cuda')
+                # pred_ind = self.train_grids[cat_i, model_i]
+                
+                # pred_mesh = self.cad_manager.model_by_id(cat_i, model_i).to('cuda')
                 # pred_ind = self.val_grid_data[cat_i, model_i]
+            
             match = None
             for j, label in enumerate(labels):
                 if covered[j]:
@@ -620,10 +631,16 @@ class Vid2CADEvaluator(DatasetEvaluator):
                 gt_trans = torch.tensor(label['t'])
                 gt_rot = np.quaternion(*label['q'])
                 gt_scale = torch.tensor(label['s'])
-                if sym_i == label['sym']:
-                    angle_diff = rotation_diff(pred_rot, gt_rot, sym_i)
-                else:
-                    angle_diff = rotation_diff(pred_rot, gt_rot)
+                # sym_i= next(
+                #     a['sym']
+                #     for a in self._scene_alignments[scene]
+                #     if int(a['catid_cad']) == int(label['catid_cad'])
+                #     and a['id_cad'] == label['id_cad']
+                # )
+                # if sym_i == label['sym']:
+                #     angle_diff = rotation_diff(pred_rot, gt_rot, sym_i)
+                # else:
+                angle_diff = rotation_diff(pred_rot, gt_rot)
                 is_correct = (
                     translation_diff(pred_trans, gt_trans) <= TRANS_THRESH
                     and angle_diff <= ROT_THRESH
@@ -635,7 +652,7 @@ class Vid2CADEvaluator(DatasetEvaluator):
                 #     trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{label['id_cad']}/models/model_normalized.obj", force='mesh').export('tst_tar.obj')
                 #     trimesh.PointCloud(nocs_comp[1].T).export('tst_nocs.ply')
                 #     exit()
-                    # self.noc_tar_trip.append((mesh, nocs_comp[1], label['id_cad']))
+                #     self.noc_tar_trip.append((pred_mesh, nocs_comp[1], label['id_cad']))
                     
                 # for k, ret_label in enumerate(ret_labels):
                 #     if ret_covered[k]:
@@ -648,21 +665,38 @@ class Vid2CADEvaluator(DatasetEvaluator):
                 #     cad_gts = [(int(rl[0]), rl[1]) for rl in ret_label]
                 #     is_correct = is_correct and (cad_pred in cad_gts)
                 if self.exact_ret:
-                    # cad_pred = (int(cat_i), model_i)
-                    # cad_gt = (int(label['catid_cad']), label['id_cad'])
-                    # is_correct = is_correct and cad_pred == cad_gt
-                    is_correct = is_correct and (model_i in self.ret_lookup[label['id_cad']])
+                    cad_pred = (int(cat_i), model_i)
+                    cad_gt = (int(label['catid_cad']), label['id_cad'])
+                    is_correct = is_correct and cad_pred == cad_gt
+                    # is_correct = is_correct and (model_i in self.ret_lookup[label['id_cad']])
                 # elif self.with_grids:
                 else:
                     try:
-                        iou = self._voxel_iou(label, pred_ind)
+                        # iou = self._voxel_iou(label, pred_ind)
                         # if iou >= 0.4:
                         # print(iou)
                         # print('Passed')
+                        gt_mesh = self.cad_manager.model_by_id(label['catid_cad'], label['id_cad']).to('cuda')
+                        metrics = compare_meshes(pred_mesh, gt_mesh)
+                        f1_score = metrics['F1@0.500000']
                     except KeyError:
                         iou = 0.0
                         print('failed')
-                    is_correct = is_correct and iou >= VOXEL_IOU_THRESH
+                    # is_correct = is_correct and iou >= VOXEL_IOU_THRESH
+                    is_correct = is_correct and f1_score >= 80.
+                
+                # if is_correct and not self.exact_ret:
+                #     self.noc_tar_trip.append((pred_mesh.cpu(), nocs_comp[1].transpose(0,1), label['id_cad']))
+                #     # mesh = trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{model_i}/models/model_normalized.obj", force='mesh')
+                #     pred_mesh = trimesh.Trimesh(pred_mesh.verts_list()[0].cpu().numpy(), pred_mesh.faces_list()[0].cpu().numpy())
+                #     pred_mesh.export('tst_pred.obj')
+                #     deform_mesh = trimesh.Trimesh(deform_mesh.verts_list()[0].cpu().numpy(), deform_mesh.faces_list()[0].cpu().numpy())
+                #     deform_mesh.export('tst_deformed.obj')
+                #     # trimesh.Trimesh(gt_mesh.verts_list()[0].cpu().numpy(), gt_mesh.faces_list()[0].cpu().numpy()).export('tst_tar.obj')
+                #     trimesh.PointCloud(nocs_comp[1].T).export('tst_nocs.ply')
+                #     # print(pred_mesh.bounds)
+                #     # print(deform_mesh.bounds)
+                #     exit()
 
                 if is_correct:
                     corrects[int(label['catid_cad'])] += 1
@@ -681,6 +715,7 @@ class Vid2CADEvaluator(DatasetEvaluator):
                     's': pred_scale.tolist()
                 })
 
+        # print([a[1] for a in zip(not_in_trains, max_f1s) if not a[0]])
         return corrects, label_counts
 
     def _voxel_iou(self, label, pred_ind):
@@ -856,20 +891,30 @@ def render_nocs(noc_trips):
         if type(_mesh) is str:
             vertices, faces, _ = load_obj(_mesh, device=device)
             mesh = Meshes([vertices], [faces.verts_idx])
+        elif type(_mesh) is Meshes:
+            mesh = _mesh
+            vertices = mesh.verts_list()[0]
         else:
             vertices, faces = (torch.from_numpy(_mesh.vertices).to(device).type(torch.float), torch.from_numpy(_mesh.faces).to(device).type(torch.float))
             mesh = Meshes([vertices], [faces])
 
         color = torch.ones(1, vertices.size(0), 3, device=device)
         mesh.textures = TexturesVertex(verts_features=color)
-        img = renderer(mesh)
+        img = renderer(mesh.to(device))
         img = (img.detach().cpu().numpy()[0] * 255).astype('uint8')
 
         return img
 
     def render_image_from_pc(pointcloud, renderer, device):
         verts = torch.Tensor(pointcloud).to(device)
-        point_cloud = Pointclouds(points=[verts], features=[torch.ones_like(verts)])
+        if verts.shape[0] == 3:
+            verts = verts.transpose(0,1)
+        try:
+            point_cloud = Pointclouds(points=[verts], features=[torch.ones_like(verts)])
+        except ValueError as e:
+            print(e)
+            print(verts.shape)
+            return np.zeros(256,256,3)
         img = renderer(point_cloud)
         img = (img.detach().cpu().numpy()[0] * 255).astype('uint8')
 
@@ -892,6 +937,7 @@ def render_nocs(noc_trips):
         image_size=256,
         blur_radius=0.0,
         faces_per_pixel=1,
+        bin_size=0
     )
     mesh_renderer = MeshRenderer(
         rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings),

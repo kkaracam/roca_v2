@@ -21,7 +21,8 @@ from roca.modeling.retrieval_head.retrieval_ops import (
     voxelize_nocs,
 )
 from roca.modeling.retrieval_head.joint_retrieve_deform_ops import (
-    get_symmetric
+    get_symmetric,
+    regression_loss
 )
 
 from pytorch3d.loss import chamfer_distance
@@ -34,10 +35,11 @@ RetrievalResult = Tuple[List[Tuple[str, str]], Tensor]
 
 
 class JointE2EHead(nn.Module):
-    def __init__(self, cfg, shape_code_size: int, margin: float = 10.):
+    def __init__(self, cfg, shape_code_size: int, margin: float = .5):
         super().__init__()
         self.has_cads = False
         self.mode = cfg.MODEL.RETRIEVAL_MODE
+        self.loss_type = cfg.MODEL.RETRIEVAL_LOSS
         self.shape_code_size = shape_code_size
         self.is_voxel = cfg.INPUT.CAD_TYPE == 'voxel'
 
@@ -49,7 +51,15 @@ class JointE2EHead(nn.Module):
         if self.baseline:
             return
 
-        self.loss = nn.TripletMarginLoss(margin=margin)
+        if self.loss_type == 'regression':
+            self.loss = nn.MSELoss()
+            self.loss_trip = nn.TripletMarginLoss(margin=margin)
+        elif self.loss_type == 'triplet':
+            self.loss = nn.TripletMarginLoss(margin=margin)
+        else:
+            self.loss_reg = nn.MSELoss()
+            self.loss_trip = nn.TripletMarginLoss(margin=margin)
+        self._sigmoid = nn.Sigmoid()
 
         if '_' in self.mode:
             self.cad_mode, self.noc_mode = self.mode.split('_')
@@ -59,8 +69,11 @@ class JointE2EHead(nn.Module):
         if self.cad_mode == 'pointnet':
             assert not self.is_voxel, 'Inconsistent CAD modality'
             self.cad_net = PointNet()
-        elif self.cad_mode in ('joint', "joint+e2e"):
-            self.cad_net = JointNet(cfg)
+        elif self.cad_mode == 'joint':
+            self.joint_net = JointNet(cfg)
+            self.cad_net_ret = PointNet()
+            self.cad_net_tar = PointNet()
+            # self.cad_net = JointNet(cfg)
         elif self.cad_mode == 'resnet':
             assert self.is_voxel, 'Inconsistent CAD modality'
             self.cad_net = ResNetEncoder()
@@ -74,35 +87,51 @@ class JointE2EHead(nn.Module):
         elif self.noc_mode in ('joint', "joint+e2e"):
             self.noc_net_ret = nn.ModuleDict({
                 'pointnet': PointNet(fc_out=True),
-                'image': self.make_image_mlp(),
-                'comp_lat': nn.Sequential(
-                    nn.Linear(512, 1024),
-                    nn.ReLU(True),
-                    nn.Linear(1024, self.cad_net.embedding_dim)
-                )
+                'image': self.make_image_mlp()
             })
             self.noc_net_tar = nn.ModuleDict({
                 'pointnet': PointNet(fc_out=True),
-                'image': self.make_image_mlp(),
-                'comp_lat': nn.Sequential(
-                    nn.Linear(512, 1024),
-                    nn.ReLU(True),
-                    nn.Linear(1024, self.cad_net.embedding_dim)
-                )
+                'image': self.make_image_mlp()
             })
-        elif self.noc_mode == 'joint+resnet+image+comp':
+        elif self.noc_mode == 'joint+mlp':
             resnet = ResNetEncoder()
             self.noc_net_ret = nn.ModuleDict({
-                'resnet': resnet,
+                'pointnet': PointNet(),
                 'image': self.make_image_mlp(),
-                'comp': ResNetDecoder(relu_in=True, feats=resnet.feats)
+                'map': nn.Sequential(
+                    # nn.Linear(1024, 1024),
+                    # nn.ReLU(),
+                    nn.Linear(1024, self.joint_net.embedding_dim)
+                )
             })
             self.noc_net_tar = nn.ModuleDict({
-                'resnet': resnet,
+                'pointnet': PointNet(),
                 'image': self.make_image_mlp(),
-                'comp': ResNetDecoder(relu_in=True, feats=resnet.feats)
+                'map': nn.Sequential(
+                    # nn.Linear(1024, 1024),
+                    # nn.ReLU(),
+                    nn.Linear(1024, self.joint_net.embedding_dim)
+                )
             })
-            self.comp_loss = nn.BCELoss()
+        elif self.noc_mode == 'joint+image':
+            resnet = ResNetEncoder()
+            self.noc_net_ret = nn.ModuleDict({
+                'image': self.make_image_mlp(),
+                'map': nn.Sequential(
+                    nn.Linear(1024, 1024),
+                    nn.ReLU(),
+                    nn.Linear(1024, self.joint_net.embedding_dim)
+                )
+            })
+            self.noc_net_tar = nn.ModuleDict({
+                'image': self.make_image_mlp(),
+                'map': nn.Sequential(
+                    nn.Linear(1024, 1024),
+                    nn.BatchNorm2d(1024),
+                    nn.ReLU(),
+                    nn.Linear(1024, self.joint_net.embedding_dim)
+                )
+            })
         elif self.noc_mode == 'image':
             self.noc_net = self.make_image_mlp()
         elif self.noc_mode == 'pointnet+image':
@@ -128,11 +157,17 @@ class JointE2EHead(nn.Module):
         else:
             raise ValueError('Unknown noc mode {}'.format(self.noc_mode))
 
-    def make_image_mlp(self, relu_out: bool = True) -> nn.Module:
+    def make_image_mlp(self, relu_out: bool = True, embed_dim=256) -> nn.Module:
+        # if self.noc_mode in ('joint', "joint+e2e"):
+        #     embed_dim = self.joint_net.embedding_dim
+        # elif self.cad_mode == 'joint':
+        #     embed_dim = self.cad_net_ret.embedding_dim
+        # else:
+        #     embed_dim = self.cad_net.embedding_dim
         return nn.Sequential(
             nn.Linear(self.shape_code_size, 1024),
             nn.ReLU(True),
-            nn.Linear(1024, self.cad_net.embedding_dim),
+            nn.Linear(1024, embed_dim),
             nn.ReLU(True) if relu_out else nn.Identity()
         )
 
@@ -204,35 +239,43 @@ class JointE2EHead(nn.Module):
             assert neg_cads is not None
 
             if self.cad_mode == 'joint':
-                # ret_noc_embed = self.noc_net_ret['pointnet'](noc_points, masks) + self.noc_net_ret['image'](shape_code)
-                # tar_noc_embed = self.noc_net_tar['pointnet'](noc_points, masks) + self.noc_net_tar['image'](shape_code)
-                ret_noc_embed = self.noc_net_ret['comp_lat'](torch.cat([self.noc_net_ret['pointnet'](noc_points, masks), self.noc_net_ret['image'](shape_code)], dim=-1))
-                tar_noc_embed = self.noc_net_tar['comp_lat'](torch.cat([self.noc_net_tar['pointnet'](noc_points, masks), self.noc_net_tar['image'](shape_code)], dim=-1))
-                ret_pos_embed, ret_neg_embed, tar_pos_embed, tar_neg_embed = self.cad_net._embed_trip(pos_cads, neg_cads)
-                losses['loss_triplet'] = (self.loss(ret_noc_embed, ret_pos_embed, ret_neg_embed) + self.loss(tar_noc_embed, tar_pos_embed, tar_neg_embed))
-            elif self.noc_mode in ('joint+resnet+image+comp', 'joint+resnet+image+fullcomp'):
-                ret_noc_embed, ret_comp, tar_noc_embed, tar_comp = self.embed_nocs(
-                    shape_code=shape_code,
-                    noc_points=noc_points,
-                    mask=masks
-                )
-                losses['loss_noc_comp'] = self.comp_loss(
-                    noc_comp, pos_cads.to(dtype=noc_comp.dtype)
-                )
-                ret_pos_embed, ret_neg_embed, tar_pos_embed, tar_neg_embed = self.cad_net._embed_trip(pos_cads, neg_cads)
-                losses['loss_triplet'] = (self.loss(ret_noc_embed, ret_pos_embed, ret_neg_embed) + self.loss(tar_noc_embed, tar_pos_embed, tar_neg_embed))
-            elif self.cad_mode == "joint+e2e":
-                ret_noc_embed = self.noc_net_ret['comp_lat'](torch.cat([self.noc_net_ret['pointnet'](noc_points, masks), self.noc_net_ret['image'](shape_code)], dim=-1))
-                tar_noc_embed = self.noc_net_tar['comp_lat'](torch.cat([self.noc_net_tar['pointnet'](noc_points, masks), self.noc_net_tar['image'](shape_code)], dim=-1))
-                candies = self.cad_net.get_candidates(ret_noc_embed.detach(), noc_points.shape[0])
-                out_pcs = self.cad_net._deform(tar_noc_embed, candies)
-                cd_loss, _ = chamfer_distance(out_pcs, pos_cads.flatten(2), batch_reduction=None)
-                fitting_loss = torch.mean(cd_loss)
-                reflected_pc = get_symmetric(out_pcs)
-                symmetric_loss, _ = chamfer_distance(out_pcs, reflected_pc)
-                fitting_loss += symmetric_loss
-                losses['loss_fitting'] = fitting_loss
-                losses['loss_embed'] = self.cad_net._retrieval(ret_noc_embed, candies, fitting_loss)
+                if self.noc_mode == 'joint+image':
+                    ret_noc_embed = self.noc_net_ret['image'](shape_code)
+                    tar_noc_embed = self.noc_net_tar['image'](shape_code)
+                else:
+                    ret_noc_embed = self.noc_net_ret['pointnet'](noc_points, masks) + self.noc_net_ret['image'](shape_code)
+                    tar_noc_embed = self.noc_net_tar['pointnet'](noc_points.detach(), masks.detach()) + self.noc_net_tar['image'](shape_code.detach())
+
+                if self.loss_type == 'regression':
+                    ret_pos_embed, tar_pos_embed = self.joint_net._embed(pos_cads)
+                    ret_noc_embed = self.noc_net_ret['map'](ret_noc_embed) if self.noc_mode == 'joint+image' else ret_noc_embed
+                    losses['loss_embedding_ret'] = self.loss(ret_noc_embed, ret_pos_embed)
+                    # losses['loss_embedding_tar'] = self.loss_trip(tar_noc_embed, tar_pos_embed[0], tar_neg_embed[0])
+                    # for i in range(tar_noc_embed.shape[0]):
+                    candidates = self.joint_net._retrieval(ret_noc_embed)
+                    fitting_loss = self.joint_net._deform(tar_noc_embed, candidates.flatten(), pos_cads)
+                    losses['loss_fitting'] = 10 * fitting_loss + self.loss(ret_noc_embed, ret_pos_embed)
+
+
+                elif self.loss_type == 'triplet': 
+                    ret_pos_embed, ret_neg_embed, tar_pos_embed, tar_neg_embed = self.joint_net._embed_trip(pos_cads, neg_cads)
+                    ret_noc_embed = self.noc_net_ret['map'](ret_noc_embed) if self.noc_mode == 'joint+image' else ret_noc_embed
+                    losses['loss_triplet'] = self.loss(ret_noc_embed, ret_pos_embed, ret_neg_embed)/2. + self.loss(tar_noc_embed, tar_pos_embed, tar_neg_embed)/2.
+                else:
+                    ret_pos_embed, ret_neg_embed, tar_pos_embed, tar_neg_embed = self.joint_net._embed_trip(pos_cads, neg_cads)
+                    ret_pos = self.cad_net_ret(pos_cads.transpose(-2,-1))
+                    ret_neg = self.cad_net_ret(neg_cads.transpose(-2,-1))
+                    # tar_pos = self.cad_net_tar(pos_cads.transpose(-2,-1))
+                    # tar_neg = self.cad_net_tar(neg_cads.transpose(-2,-1))
+
+                    losses['loss_triplet'] = self.loss_trip(ret_noc_embed, ret_pos, ret_neg)# + self.loss_trip(tar_noc_embed, tar_pos, tar_neg)
+                    ret_pos = self.noc_net_ret['map'](ret_pos)
+                    # tar_pos = self.noc_net_tar['map'](tar_pos)
+                    ret_noc_embed = self.noc_net_ret['map'](ret_noc_embed)
+                    # tar_noc_embed = self.noc_net_tar['map'](tar_noc_embed)
+                    losses['loss_embed'] = self.loss_reg(ret_pos, ret_pos_embed)# + self.loss_reg(tar_pos, tar_pos_embed)
+                    losses['loss_embed'] += self.loss_reg(ret_pos, ret_noc_embed)# + self.loss_reg(tar_pos, tar_noc_embed)
+
             else:
                 noc_embed = self.embed_nocs(
                     shape_code=shape_code,
@@ -286,7 +329,6 @@ class JointE2EHead(nn.Module):
         noc_points: Optional[Tensor] = None,
         mask: Optional[Tensor] = None
     ) -> Tensor:
-
         # Assertions
         if 'image' in self.noc_mode:
             assert shape_code is not None
@@ -353,7 +395,7 @@ class JointE2EHead(nn.Module):
         elif self.is_voxel:
             return self.cad_net(cad_points.float())
         elif self.cad_mode == 'joint':
-            return self.cad_net(cad_points)
+            return self.joint_net(cad_points)
         else:  # Point clouds
             return self.cad_net(cad_points.transpose(-2, -1))
 
@@ -443,7 +485,6 @@ class JointE2EHead(nn.Module):
         wild_retrieval,
         shape_code
     ):
-        # NOTE: assume cad embeddings instead of cad points
         if wild_retrieval:
             noc_embeds = self.embed_nocs(shape_code, noc_points, pred_masks)
             cad_ids = embedding_lookup(
@@ -460,21 +501,44 @@ class JointE2EHead(nn.Module):
             cad_ids = [None for _ in scenes]
             params = [None for _ in scenes]
             retrieved_idx = [None for _ in scenes]
-            if self.noc_mode == 'joint':
+            if 'joint' in self.noc_mode:
                 _reps = noc_points.shape[0]
+                
                 nocs_sampled = noc_points.view(_reps, 3, -1)
-                # ret_noc_embed = self.noc_net_ret['pointnet'](noc_points, pred_masks) + self.noc_net_ret['image'](shape_code)
-                # tar_noc_embed = self.noc_net_tar['pointnet'](noc_points, pred_masks) + self.noc_net_tar['image'](shape_code)
-                ret_noc_embed = self.noc_net_ret['comp_lat'](torch.cat([self.noc_net_ret['pointnet'](noc_points, pred_masks), self.noc_net_ret['image'](shape_code)], dim=-1))
-                tar_noc_embed = self.noc_net_tar['comp_lat'](torch.cat([self.noc_net_tar['pointnet'](noc_points, pred_masks), self.noc_net_tar['image'](shape_code)], dim=-1))
+                if self.noc_mode == 'joint+image':
+                    ret_noc_embed = self.noc_net_ret['image'](shape_code)
+                    tar_noc_embed = self.noc_net_tar['image'](shape_code)
+                    # ret_noc_embed, tar_noc_embed = (self.noc_net_ret['map'](ret_noc_embed), self.noc_net_tar['map'](tar_noc_embed))
+                    ret_noc_embed = self.noc_net_ret['map'](ret_noc_embed)
+                else:
+                    ret_noc_embed = self.noc_net_ret['pointnet'](noc_points, pred_masks) + self.noc_net_ret['image'](shape_code)
+                    tar_noc_embed = self.noc_net_tar['pointnet'](noc_points, pred_masks) + self.noc_net_tar['image'](shape_code)
+                if 'mlp' in self.noc_mode:
+                    ret_noc_embed, tar_noc_embed = (self.noc_net_ret['map'](ret_noc_embed), self.noc_net_tar['map'](tar_noc_embed))
+                # ret_noc_embed = self.noc_net_ret['comp_lat'](torch.cat([self.noc_net_ret['pointnet'](noc_points, pred_masks), self.noc_net_ret['image'](shape_code)], dim=-1))
+                # tar_noc_embed = self.noc_net_tar['comp_lat'](torch.cat([self.noc_net_tar['pointnet'](noc_points, pred_masks), self.noc_net_tar['image'](shape_code)], dim=-1))
+                # ret_noc_embed, tar_noc_embed = self.cad_net._embed(nocs_sampled.transpose(2,1))
+
                 for scene in set(scenes):
                     scene_mask = [scene_ == scene for scene_ in scenes]
                     scene_noc_embeds = ret_noc_embed[scene_mask]
                     scene_tar_embeds = tar_noc_embed[scene_mask]
                     scene_classes = pred_classes[scene_mask]
 
-                    retrieved_idx_scene, cad_ids_scene = self.cad_net._retrieval_inference(scene_noc_embeds, scene_noc_embeds.shape[0])
-                    params_scene = self.cad_net._deform_inference(scene_tar_embeds, scene_noc_embeds.shape[0], retrieved_idx_scene, scenes=scenes, has_alignment=has_alignment, pred_classes=pred_classes)
+                    # retrieved_idx_scene, cad_ids_scene = self.joint_net._retrieval_inference(scene_noc_embeds, scene_noc_embeds.shape[0])
+                    # if scene_noc_embeds.shape[0] == 1:
+                        # print(scene_noc_embeds.shape[0])
+                    # retrieved_idx_scene = []
+                    # cad_ids_scene = []
+                    # params_scene = []
+                    # for i in range(scene_noc_embeds.shape[0]):
+                    #     _rets, _cads = self.joint_net._retrieval_inference(scene_noc_embeds[i].unsqueeze(0), 1)
+                    #     retrieved_idx_scene.extend(_rets)
+                    #     cad_ids_scene.extend(_cads)
+                    #     params_scene.extend(self.joint_net._deform_inference(scene_tar_embeds[i].unsqueeze(0), _rets))
+
+                    retrieved_idx_scene, cad_ids_scene = self.joint_net._retrieval_inference(scene_noc_embeds, scene_noc_embeds.shape[0])
+                    params_scene = self.joint_net._deform_inference(scene_tar_embeds, retrieved_idx_scene)
                     cad_ids_scene.reverse()
                     params_scene.reverse()
                     retrieved_idx_scene.reverse()
@@ -486,7 +550,7 @@ class JointE2EHead(nn.Module):
                 has_alignment[[id is None for id in cad_ids]] = False
             
                 pred_indices = torch.arange(pred_classes.numel(), dtype=torch.long)
-                return cad_ids, pred_indices, params, retrieved_idx, torch.cat([noc_points.view(_reps, 3, -1).unsqueeze(1), noc_points.view(_reps, 3, -1).unsqueeze(1)], dim=1)
+                return cad_ids, pred_indices, params, retrieved_idx, torch.cat([nocs_sampled.view(_reps,3,-1).unsqueeze(1), nocs_sampled.view(_reps,3,-1).unsqueeze(1)], dim=1)
             else:
                 noc_embeds = self.embed_nocs(shape_code, noc_points, pred_masks)
                 for scene in set(scenes):
@@ -517,6 +581,6 @@ class JointE2EHead(nn.Module):
                             cad_ids[i] = cad_ids_scene.pop()
                 has_alignment[[id is None for id in cad_ids]] = False
 
-            pred_indices = torch.arange(pred_classes.numel(), dtype=torch.long)
+        pred_indices = torch.arange(pred_classes.numel(), dtype=torch.long)
 
-            return cad_ids, pred_indices
+        return cad_ids, pred_indices

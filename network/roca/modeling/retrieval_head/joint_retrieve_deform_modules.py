@@ -71,13 +71,13 @@ class TargetEncoder(nn.Module):
         num_points = x.shape[1]
         x = x[:, :, : self.input_channels]
         x = x.transpose(2, 1)  # transpose to apply 1D convolution
-        # trs = self.stn1(x)
-        # x = trs @ x
         x = self.mlp1(x)
         x = self.mlp2(x)
-        x = F.max_pool1d(x, num_points).squeeze(2)  # max pooling
-        x = self.fc(x)
-        return x
+        x_ftrs = F.max_pool1d(x, num_points).squeeze(2)  # max pooling
+        x = self.fc(x_ftrs)
+        return x#, x_ftrs
+    def latent_from_feats(self, x_ftrs):
+        return self.fc(x_ftrs)
 
 class TargetEncoder2(nn.Module):
     def __init__(self, embedding_size, input_channels=3):

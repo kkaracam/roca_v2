@@ -21,6 +21,7 @@ python main.py \
     --steps 60000 \
     --retrieval_mode $RETRIEVAL_MODE \
     --retrieval_loss $RETRIEVAL_LOSS \
+    --joint_model_path $JOINT_MODEL_PATH \
     --e2e $E2E \
     --seed $SEED \
     --batch_size 2

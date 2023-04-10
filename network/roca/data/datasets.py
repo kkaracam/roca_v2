@@ -29,16 +29,16 @@ def register_scan2cad(
         data_dir, 'scan2cad_instances_{}.json'.format(split)
     )
     # json_file = os.path.join(
-    #     data_dir, 'scan2cad_instances_val_mock.json'.format(split)
+    #     data_dir, 'scan2cad_instances_{}_mock.json'.format(split)
     # )
-    cad_file = os.path.join(data_dir, 'scan2cad_{}_cads.pkl'.format(split))
+    cad_file = os.path.join(data_dir, 'scan2cad_{}_cads_center.pkl'.format(split))
     category_file = os.path.join(data_dir, 'scan2cad_alignment_classes.json')
-    point_file = os.path.join(data_dir, 'points_{}.pkl'.format(split))
+    point_file = os.path.join(data_dir, 'points_{}_center.pkl'.format(split))
     if not os.path.isfile(point_file):
         point_file = None if split == 'train' else 'assets/points_val.pkl'
-    grid_file = os.path.join(data_dir, '{}_grids_32.pkl'.format(split))
-    train_grid_file = os.path.join(data_dir, 'train_grids_32.pkl')
-    val_grid_file = os.path.join(data_dir, 'val_grids_32.pkl')
+    grid_file = os.path.join(data_dir, '{}_grids_32_center.pkl'.format(split))
+    train_grid_file = os.path.join(data_dir, 'train_grids_32_center.pkl')
+    val_grid_file = os.path.join(data_dir, 'val_grids_32_center.pkl')
 
     # TODO: may need a train scenes in the future
     scene_file = None
@@ -62,6 +62,7 @@ def register_scan2cad(
         ret_lookup=ret_lookup,
         train_grid_file=train_grid_file,
         val_grid_file=val_grid_file,
+        point_file=point_file,
         **metadata
     )
 

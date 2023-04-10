@@ -857,28 +857,28 @@ class AlignmentHead(nn.Module):
                 predictions['pred_indices'] = pred_indices
 
         if self.wild_retrieval:
-            # wild_cad_ids, wild_pred_indices = self.retrieval_head(
-            #     scenes=scenes,
-            #     instance_sizes=instance_sizes,
-            #     classes=pred_classes,
-            #     masks=pred_masks,
-            #     noc_points=noc_points,
-            #     wild_retrieval=self.wild_retrieval,
-            #     shape_code=shape_code
-            # )
-            # extra_outputs['wild_cad_ids'] = wild_cad_ids
-            # predictions['pred_wild_indices'] = wild_pred_indices
-            cad_ids, pred_indices, params, idx = self.retrieval_head(
+            wild_cad_ids, wild_pred_indices = self.retrieval_head(
+                scenes=scenes,
+                instance_sizes=instance_sizes,
                 classes=pred_classes,
                 masks=pred_masks,
                 noc_points=noc_points,
-                scenes=scenes,
-                instance_sizes=instance_sizes,
-                has_alignment=has_alignment
+                wild_retrieval=self.wild_retrieval,
+                shape_code=shape_code
             )
-            extra_outputs['wild_cad_ids'] = cad_ids
-            extra_outputs['pred_wild_params'] = params
-            extra_outputs['wild_joint_idx'] = idx
-            predictions['pred_wild_indices'] = pred_indices
+            extra_outputs['cad_ids'] = wild_cad_ids
+            predictions['pred_indices'] = wild_pred_indices
+            # cad_ids, pred_indices, params, idx = self.retrieval_head(
+            #     classes=pred_classes,
+            #     masks=pred_masks,
+            #     noc_points=noc_points,
+            #     scenes=scenes,
+            #     instance_sizes=instance_sizes,
+            #     has_alignment=has_alignment
+            # )
+            # extra_outputs['wild_cad_ids'] = cad_ids
+            # extra_outputs['pred_wild_params'] = params
+            # extra_outputs['wild_joint_idx'] = idx
+            # predictions['pred_wild_indices'] = pred_indices
 
         return predictions, extra_outputs

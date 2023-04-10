@@ -50,7 +50,7 @@ class JointNet(nn.Module):
         self.K = 10
         self.MARGIN = .5
         self.SOURCE_MODEL_INFO = []
-        self.SOURCE_SIGMAS = torch.autograd.Variable(torch.randn((len(sources),1), dtype=torch.float, device=self.device), requires_grad=True)
+        # self.SOURCE_SIGMAS = torch.autograd.Variable(torch.randn((len(sources),1), dtype=torch.float, device=self.device), requires_grad=True)
         # self.device = 'cuda:0'
         print("Loading joint sources...")
         with open("/home/karacam/Thesis/joint_learning_retrieval_deformation/shape2part_ext.json", 'r') as f:
@@ -58,7 +58,6 @@ class JointNet(nn.Module):
         part2shape = dict([(value, key) for key, value in shape2part['chair']['model_names'].items()])
 
         for i in range(len(sources)):
-        # for i in range(50):
             source_model = sources[i]
             src_filename = str(source_model) + "_leaves.h5"
 
@@ -119,51 +118,58 @@ class JointNet(nn.Module):
         _model = torch.load(cfg.JOINT_MODEL_PATH)
         self.target_encoder.load_state_dict(_model["target_encoder"])
         self.target_encoder.to(self.device)
-        # self.target_encoder.eval()
+        self.target_encoder.eval()
+        for p in self.target_encoder.parameters():
+            p.requires_grad = False
 
         self.param_decoder.load_state_dict(_model["param_decoder"])
         self.param_decoder.to(self.device)
-        # self.param_decoder.eval()
+        self.param_decoder.eval()
+        for p in self.param_decoder.parameters():
+            p.requires_grad = False
 
         self.retrieval_encoder.load_state_dict(_model["retrieval_encoder"])
         self.retrieval_encoder.to(self.device)
-        # self.retrieval_encoder.eval()
+        self.retrieval_encoder.eval()
+        for p in self.retrieval_encoder.parameters():
+            p.requires_grad = False
 
-        self.SOURCE_LATENT_CODES = _model["source_latent_codes"]#.detach()
-        # self.SOURCE_PART_LATENT_CODES = [_x.detach() for _x in _model["part_latent_codes"]]
-        self.SOURCE_PART_LATENT_CODES = [_x for _x in _model["part_latent_codes"]]
+        self.SOURCE_LATENT_CODES = _model["source_latent_codes"].detach()
+        self.SOURCE_PART_LATENT_CODES = [_x.detach() for _x in _model["part_latent_codes"]]
 
-        self.SOURCE_VARIANCES = _model["source_variances"]#.detach()
+        self.SOURCE_VARIANCES = _model["source_variances"].detach()
 
-        # self.source_labels = torch.arange(len(self.SOURCE_MODEL_INFO))#.repeat(10)
-        # src_mats, src_default_params, src_connectivity_mat = get_source_info(self.source_labels, self.SOURCE_MODEL_INFO, self.MAX_NUM_PARAMS, use_connectivity=True)
-        # self.src_latent_codes = torch.gather(self.SOURCE_LATENT_CODES, 0, self.source_labels.to(self.device).unsqueeze(-1).repeat(1,self.SOURCE_LATENT_CODES.shape[-1]))
+        self.source_labels = torch.arange(len(self.SOURCE_MODEL_INFO))#.repeat(10)
+        src_mats, src_default_params, src_connectivity_mat = get_source_info(self.source_labels, self.SOURCE_MODEL_INFO, self.MAX_NUM_PARAMS, use_connectivity=True)
+        self.src_latent_codes = torch.gather(self.SOURCE_LATENT_CODES, 0, self.source_labels.to(self.device).unsqueeze(-1).repeat(1,self.SOURCE_LATENT_CODES.shape[-1]))
 
-        # self.mat = torch.stack([mat for mat in src_mats])#.to(device, dtype=torch.float)
-        # self.def_param = torch.stack([def_param for def_param in src_default_params])#.to(device, dtype=torch.float)
-        # self.conn_mat = torch.stack([conn_mat for conn_mat in src_connectivity_mat])
+        self.mat = torch.stack([mat for mat in src_mats])#.to(device, dtype=torch.float)
+        self.def_param = torch.stack([def_param for def_param in src_default_params])#.to(device, dtype=torch.float)
+        self.conn_mat = torch.stack([conn_mat for conn_mat in src_connectivity_mat])
 
-        # with torch.no_grad():
-        # self.ret_src_latent_codes = []
-        # num_sets = 20
-        # interval = int(len(self.source_labels)/num_sets)
+        with torch.no_grad():
+            self.ret_src_latent_codes = []
+            num_sets = 20
+            interval = int(len(self.source_labels)/num_sets)
 
-        # for j in range(num_sets):
-        #     if (j==num_sets-1):
-        #         curr_src_latent_codes = self.get_source_latent_codes_encoder(self.source_labels[j*interval:], self.retrieval_encoder)
-        #     else:
-        #         curr_src_latent_codes = self.get_source_latent_codes_encoder(self.source_labels[j*interval:(j+1)*interval], self.retrieval_encoder)
-        #     self.ret_src_latent_codes.append(curr_src_latent_codes)
+            for j in range(num_sets):
+                if (j==num_sets-1):
+                    curr_src_latent_codes = self.get_source_latent_codes_encoder(self.source_labels[j*interval:])
+                else:
+                    curr_src_latent_codes = self.get_source_latent_codes_encoder(self.source_labels[j*interval:(j+1)*interval])
+                self.ret_src_latent_codes.append(curr_src_latent_codes)
 
-        # self.ret_src_latent_codes = torch.cat(self.ret_src_latent_codes)#.view(len(self.SOURCE_MODEL_INFO), -1, self.SOURCE_LATENT_DIM)
+            self.ret_src_latent_codes = torch.cat(self.ret_src_latent_codes)#.view(len(self.SOURCE_MODEL_INFO), -1, self.SOURCE_LATENT_DIM)
     
     def forward(self, x):
+        # with torch.no_grad():
         ret = self.retrieval_encoder(x)
         tar = self.target_encoder(x)
         res = torch.cat([ret, tar], dim=-1)
         return res
     
     def _embed(self, x):
+        # with torch.no_grad():
         ret = self.retrieval_encoder(x)
         tar = self.target_encoder(x)
         return ret, tar
@@ -172,7 +178,8 @@ class JointNet(nn.Module):
         self,
         pos,
         neg
-    ):      
+    ):  
+        # with torch.no_grad():
         tar_pos_embeds = self.target_encoder(pos)
         tar_neg_embeds = self.target_encoder(neg)
         
@@ -183,26 +190,33 @@ class JointNet(nn.Module):
     
     def _retrieval(
         self,
-        retrieval_latent_codes,
-        source_labels,
-        fitting_loss
+        retrieval_latent_codes
     ):
-        retrieval_latent_codes = retrieval_latent_codes.unsqueeze(0).repeat(self.K,1,1)
-        retrieval_latent_codes = retrieval_latent_codes.view(-1, retrieval_latent_codes.shape[-1])
+        _retrieval_latent_codes = retrieval_latent_codes.unsqueeze(0).repeat(len(self.SOURCE_MODEL_INFO),1,1)
+        # retrieval_latent_codes = retrieval_latent_codes.view(-1, retrieval_latent_codes.shape[-1])	
+        _retrieval_latent_codes = _retrieval_latent_codes.view(len(self.SOURCE_MODEL_INFO), -1, self.TARGET_LATENT_DIM)
 
-        src_latent_codes = self.get_source_latent_codes_encoder(source_labels, self.SOURCE_MODEL_INFO, self.retrieval_encoder)
-        src_latent_codes = src_latent_codes.view(self.K, -1, self.SOURCE_LATENT_DIM)
-        
-        src_variances = get_source_latent_codes_fixed(source_labels, self.SOURCE_VARIANCES, device=self.device)
-        src_variances = src_variances.view(self.K, -1, self.SOURCE_LATENT_DIM)
+        with torch.no_grad():
+            source_labels = self.source_labels.unsqueeze(0).repeat(retrieval_latent_codes.shape[0],1).T.flatten()
+            _src_latent_codes = self.ret_src_latent_codes[source_labels].view(len(self.SOURCE_MODEL_INFO), -1, self.SOURCE_LATENT_DIM)
 
-        distances = compute_mahalanobis(retrieval_latent_codes, src_latent_codes, src_variances, activation_fn=torch.sigmoid)
+            src_variances = get_source_latent_codes_fixed(source_labels, self.SOURCE_VARIANCES, device=self.device)
+            src_variances = src_variances.view(len(self.SOURCE_MODEL_INFO), -1, self.SOURCE_LATENT_DIM)
 
-        obj_sigmas =  get_source_latent_codes_fixed(source_labels, self.SOURCE_SIGMAS, device=self.device)
-        obj_sigmas = obj_sigmas.view(self.K, -1)
-        embedding_loss = regression_loss(distances, fitting_loss, obj_sigmas)
+        distances = compute_mahalanobis(retrieval_latent_codes, _src_latent_codes, src_variances, activation_fn=torch.sigmoid)
+        sorted_indices = torch.argsort(distances, dim=0)
+        if self.training:
+            # embedding_loss = regression_loss(distances, fitting_loss, obj_sigmas)
+            retrieved_idx = sorted_indices[0,:]
+            # obj_sigmas =  get_source_latent_codes_fixed(retrieved_idx, self.SOURCE_SIGMAS, device=self.device)
+            # obj_sigmas = obj_sigmas.view(-1)
 
-        return torch.mean(embedding_loss)
+            return retrieved_idx#, obj_sigmas
+        else:
+            retrieved_idx = sorted_indices[0,:]
+
+            cad_ids = [self.SOURCE_MODEL_INFO[sl]['model_id'] for sl in retrieved_idx]
+            return retrieved_idx.tolist(), cad_ids
     
     def _retrieval_inference(
         self,
@@ -213,8 +227,8 @@ class JointNet(nn.Module):
         # retrieval_latent_codes = retrieval_latent_codes.view(-1, retrieval_latent_codes.shape[-1])	
         retrieval_latent_codes = retrieval_latent_codes.view(len(self.SOURCE_MODEL_INFO), -1, self.TARGET_LATENT_DIM)
         with torch.no_grad():
-            source_labels = self.source_labels.repeat(reps)
-            _src_latent_codes = self.ret_src_latent_codes.repeat(reps,1).view(len(self.SOURCE_MODEL_INFO), -1, self.SOURCE_LATENT_DIM)
+            source_labels = self.source_labels.unsqueeze(0).repeat(reps,1).T.flatten()
+            _src_latent_codes = self.ret_src_latent_codes[source_labels].view(len(self.SOURCE_MODEL_INFO), -1, self.SOURCE_LATENT_DIM)
 
             src_variances = get_source_latent_codes_fixed(source_labels, self.SOURCE_VARIANCES, device=self.device)
             src_variances = src_variances.view(len(self.SOURCE_MODEL_INFO), -1, self.SOURCE_LATENT_DIM)
@@ -225,6 +239,7 @@ class JointNet(nn.Module):
 
         cad_ids = [self.SOURCE_MODEL_INFO[sl]['model_id'] for sl in retrieved_idx]
         return retrieved_idx.tolist(), cad_ids
+        # return _retrieved_idx.tolist(), _cad_ids
     
     def get_candidates(
         self,
@@ -249,12 +264,12 @@ class JointNet(nn.Module):
     def _deform(
         self,
         target_latent_codes,
-        candidates
+        candidates,
+        gt_pc = None
     ): 
-        src_latent_codes = self.get_source_latent_codes_encoder(candidates, self.target_encoder)
-        print(src_latent_codes.shape)
-        exit()
-        concat_latent_code = torch.cat((src_latent_codes, target_latent_codes.repeat(self.K,1,1).view(-1, target_latent_codes.shape[-1])), dim=1)
+        src_latent_codes = self.src_latent_codes[candidates]
+        concat_latent_code = torch.cat((src_latent_codes, target_latent_codes), dim=1)
+        # concat_latent_code = torch.cat((src_latent_codes, target_latent_codes.repeat(self.K,1,1).view(-1, target_latent_codes.shape[-1])), dim=1)
 
         # src_latent_codes = self.src_latent_codes.repeat(reps,1)
         # concat_latent_code = torch.cat((src_latent_codes, target_latent_codes.repeat(len(self.SOURCE_MODEL_INFO),1,1).view(-1, target_latent_codes.shape[-1])), dim=1)
@@ -262,11 +277,11 @@ class JointNet(nn.Module):
         all_params = []
         # source_labels = self.source_labels.repeat(reps)
         for j in range(concat_latent_code.shape[0]):
-            curr_num_parts = self.SOURCE_MODEL_INFO[self.source_labels[j]]["num_parts"]
+            curr_num_parts = self.SOURCE_MODEL_INFO[candidates[j]]["num_parts"]
             curr_code = concat_latent_code[j]
             curr_code_repeated = curr_code.view(1,curr_code.shape[0]).repeat(curr_num_parts, 1)
             
-            part_latent_codes = self.SOURCE_PART_LATENT_CODES[self.source_labels[j]]
+            part_latent_codes = self.SOURCE_PART_LATENT_CODES[candidates[j]]
 
             full_latent_code = torch.cat((curr_code_repeated, part_latent_codes), dim=1)
 
@@ -280,23 +295,25 @@ class JointNet(nn.Module):
             params = params.view(-1, 1)
             all_params.append(params)
 
-        params = torch.stack(all_params)
-        output_pc = get_shape(self.mat.repeat(self.K,1), params, self.def_param.repeat(self.K,1), self.ALPHA, connectivity_mat=self.conn_mat.repeat(self.K,1))
-        # print(idx.shape)
-        # print(self.mat[self.source_labels[idx].flatten()].shape)
-        return output_pc
+        if self.training:
+            params = torch.stack(all_params)
+            output_pc = get_shape(self.mat[candidates].to(self.device), params, self.def_param[candidates].to(self.device), self.ALPHA, connectivity_mat=self.conn_mat[candidates].to(self.device))
+            cd, _ = chamfer_distance(output_pc, gt_pc)
+            reflected_pc = get_symmetric(output_pc)
+            symmetric_loss, _ = chamfer_distance(output_pc, reflected_pc)
+            fitting_loss = cd + symmetric_loss
+            return fitting_loss
+        else:
+            return all_params
     
     def _deform_inference(
         self,
         target_latent_codes,
-        reps,
         idx,
-        pred_classes,
-        scenes: Optional[List[str]] = None,
-        has_alignment: Optional[Tensor] = None,
     ): 
         src_latent_codes = self.src_latent_codes[idx]
-        concat_latent_code = torch.cat((src_latent_codes, target_latent_codes.view(-1, target_latent_codes.shape[-1])), dim=1)
+        # concat_latent_code = torch.cat((src_latent_codes, target_latent_codes.view(-1, target_latent_codes.shape[-1])), dim=1)
+        concat_latent_code = torch.cat((src_latent_codes, target_latent_codes), dim=1)
 
         # src_latent_codes = self.src_latent_codes.repeat(reps,1)
         # concat_latent_code = torch.cat((src_latent_codes, target_latent_codes.repeat(len(self.SOURCE_MODEL_INFO),1,1).view(-1, target_latent_codes.shape[-1])), dim=1)
@@ -304,11 +321,11 @@ class JointNet(nn.Module):
         all_params = []
         # source_labels = self.source_labels.repeat(reps)
         for j in range(concat_latent_code.shape[0]):
-            curr_num_parts = self.SOURCE_MODEL_INFO[self.source_labels[j]]["num_parts"]
+            curr_num_parts = self.SOURCE_MODEL_INFO[self.source_labels[idx[j]]]["num_parts"]
             curr_code = concat_latent_code[j]
             curr_code_repeated = curr_code.view(1,curr_code.shape[0]).repeat(curr_num_parts, 1)
             
-            part_latent_codes = self.SOURCE_PART_LATENT_CODES[self.source_labels[j]]
+            part_latent_codes = self.SOURCE_PART_LATENT_CODES[self.source_labels[idx[j]]]
 
             full_latent_code = torch.cat((curr_code_repeated, part_latent_codes), dim=1)
 
@@ -323,20 +340,18 @@ class JointNet(nn.Module):
             all_params.append(params)
 
         # params = torch.stack(all_params)
-        # print(idx.shape)
-        # print(self.mat[self.source_labels[idx].flatten()].shape)
         return all_params
 
-    def get_source_latent_codes_encoder(self, source_labels, encoder):
+    def get_source_latent_codes_encoder(self, source_labels):
         source_points = []
 
-        for source_label in source_labels:
-            src_points = self.SOURCE_MODEL_INFO[source_label]["points"]	
-            source_points.append(src_points)
-        source_points = np.array(source_points)
+        # for source_label in source_labels:
+        #     src_points = self.SOURCE_MODEL_INFO[source_label]["points"]	
+        #     source_points.append(src_points)
+        source_points = np.array([self.SOURCE_MODEL_INFO[source_label]["points"] for source_label in source_labels])
         source_points = torch.from_numpy(source_points).to(self.device, dtype=torch.float)
 
-        src_latent_codes = encoder(source_points)
+        src_latent_codes = self.retrieval_encoder(source_points)
         return src_latent_codes
 
     @property

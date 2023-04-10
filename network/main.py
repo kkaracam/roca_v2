@@ -51,6 +51,7 @@ def parse_args(args=None):
     parser.add_argument('--irls_iters', default=1, type=int)
     parser.add_argument('--retrieval_mode', default='resnet_resnet+image+comp')
     parser.add_argument('--retrieval_loss', default='triplet')
+    parser.add_argument('--joint_model_path', default='')
     parser.add_argument('--wild_retrieval', type=int, default=0)
     parser.add_argument('--confidence_thresh_test', type=float, default=0.5)
     parser.add_argument('--e2e', type=int, default=1)
@@ -127,6 +128,7 @@ def make_config(train_name, val_name, args):
         irls_iters=args.irls_iters,
         retrieval_mode=args.retrieval_mode,
         retrieval_loss=args.retrieval_loss,
+        joint_model_path=args.joint_model_path,
         wild_retrieval=bool(args.wild_retrieval),
         confidence_thresh_test=args.confidence_thresh_test,
         e2e=bool(args.e2e)

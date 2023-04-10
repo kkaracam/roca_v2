@@ -3,12 +3,15 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 import sys
 import pickle
 import numpy as np
-import quaternion
+# np.random.seed(0)
+
 import json
 import cv2
 import trimesh
 import h5py
 import random
+from joblib import Parallel, delayed
+import multiprocessing
 from copy import deepcopy
 from tqdm import tqdm
 from itertools import product
@@ -17,6 +20,19 @@ from scipy.spatial import cKDTree as KDTree
 import torch
 from torch import nn
 from pytorch3d.loss import chamfer_distance
+from pytorch3d.structures import Meshes
+from pytorch3d.renderer import(
+    look_at_view_transform,
+    PerspectiveCameras,
+    FoVPerspectiveCameras,
+    RasterizationSettings,
+    MeshRenderer,
+    MeshRasterizer,
+    SoftPhongShader,
+    TexturesVertex
+)
+from PIL import Image
+
 sys.path.append('network')
 from network.roca.utils.linalg import decompose_mat4, make_M_from_tqs
 from network.roca.modeling.retrieval_head.joint_retrieve_deform_ops import (
@@ -28,10 +44,16 @@ from network.roca.modeling.retrieval_head.joint_retrieve_deform_ops import (
 )
 from network.roca.modeling.retrieval_head.joint_retrieve_deform_modules import (
     TargetEncoder,
-    TargetEncoder2,
     TargetDecoder,
     ParamDecoder2
 )
+
+from network.roca.utils.ap import compare_meshes
+from point_cloud_utils import pairwise_distances, sinkhorn, earth_movers_distance
+from torch_cluster import fps
+
+import logging
+logging.getLogger('trimesh').setLevel('ERROR')
 
 # sys.path.append("/home/karacam/Thesis/joint_learning_retrieval_deformation")
 # from img_grid import mesh_renderer, render_image_from_mesh
@@ -336,18 +358,16 @@ def compare_ious(oracle_retrieval=False):
         return src_latent_codes
 
     JOINT_BASE_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/'
-    JOINT_SRC_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/data/roca_sources_part_thresh_32_1024p_v1/chair/h5'
-    JOINT_MODEL_PATH = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/log/chair522_1024p_v1_icp/model.pth'
-    filename_pickle = JOINT_BASE_DIR+"data/generated_datasplits/chair_522_roca_v1.pickle"
+    JOINT_SRC_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/data/roca_sources_part_thresh_32_1024p_v2/chair/h5'
+    JOINT_MODEL_PATH = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/log/chair519_1024p_v2_reg/model.pth'
+    filename_pickle = JOINT_BASE_DIR+"data/generated_datasplits/chair_519_roca_v2.pickle"
     with open(filename_pickle, 'rb') as handle:
         sources = pickle.load(handle)['sources']
     src_data_fol = JOINT_SRC_DIR
     MAX_NUM_PARAMS = -1
     MAX_NUM_PARTS = -1
     ALPHA = 0.1
-    USE_SYMMETRY = True
     K = 5
-    MARGIN = 10.0
     device = 'cuda'
     SOURCE_MODEL_INFO = []
     print("Loading joint sources...")
@@ -360,7 +380,7 @@ def compare_ious(oracle_retrieval=False):
         src_filename = str(source_model) + "_leaves.h5"
 
         default_param, points, point_labels, points_mat, \
-                        constraint_mat,	constraint_proj_mat	= get_model(src_data_fol + '/' + src_filename, constraint=True)
+                    constraint_mat,	constraint_proj_mat	= get_model(src_data_fol + '/' + src_filename, constraint=True)
 
         curr_source_dict = {}
         curr_source_dict["default_param"] = default_param
@@ -417,7 +437,6 @@ def compare_ious(oracle_retrieval=False):
 
     SOURCE_LATENT_CODES = _model["source_latent_codes"].detach()
     SOURCE_PART_LATENT_CODES = [_x.detach() for _x in _model["part_latent_codes"]]
-
     SOURCE_VARIANCES = _model["source_variances"].detach()
 
     source_labels = torch.arange(len(SOURCE_MODEL_INFO))#.repeat(10)
@@ -441,11 +460,6 @@ def compare_ious(oracle_retrieval=False):
 
         ret_src_latent_codes = torch.cat(ret_src_latent_codes)
     
-    with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/scan2cad_instances_val.json', 'r') as anno_f:
-        annos = json.load(anno_f)['annotations']
-    with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/scan2cad_val_scenes.json', 'r') as svf:
-        val_scenes = json.load(svf)
-    top5_gt = {s:[] for s in val_scenes}
     with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/points_val.pkl', 'rb') as f:
         points_val = pickle.load(f)
     with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/val_grids_32.pkl', 'rb') as f:
@@ -454,6 +468,7 @@ def compare_ious(oracle_retrieval=False):
     tar_pcs = {(ps['catid_cad'],ps['id_cad']):ps['points'] for ps in points_val}
 
     ious = []
+    exact = 0
     for cat_id, model_id in tqdm(tar_pcs):
         # tar_pc_np = mesh.sample(1024)
         tar_pc = tar_pcs[cat_id, model_id]
@@ -465,12 +480,12 @@ def compare_ious(oracle_retrieval=False):
         except FileNotFoundError:
             print("MODEL NOT FOUND!?!?")
 
-        m_max = np.asarray(_meta['max'])
-        m_min = np.asarray(_meta['min'])
-        diag = m_max - m_min
-        center = (m_max + m_min)/2
-        centroid = np.asarray(_meta['centroid'])
-        tar_pc = tar_pc + (centroid - center) / np.linalg.norm(diag)
+        # m_max = np.asarray(_meta['max'])
+        # m_min = np.asarray(_meta['min'])
+        # diag = m_max - m_min
+        # center = (m_max + m_min)/2
+        # centroid = np.asarray(_meta['centroid'])
+        # tar_pc = tar_pc + (centroid - center) / np.linalg.norm(diag)
         tar_pc = torch.from_numpy(tar_pc).unsqueeze(0).to(device, dtype=torch.float)
         tar_pc.requires_grad = False
 
@@ -568,13 +583,16 @@ def compare_ious(oracle_retrieval=False):
                 vertices=output_vertices,
                 faces=SOURCE_MODEL_INFO[retrieved_idx[0]]["faces"]
             )
+        ret_id = SOURCE_MODEL_INFO[retrieved_idx[0]]['model_id'][1]
+        if ret_id == model_id:
+            exact +=1 
         # mesh.vertices = mesh.vertices + (center - centroid) / np.linalg.norm(diag)
         pred_ind = voxelize_mesh(mesh)
-        gt_mesh = trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v1/03001627/{model_id}/model.obj", force='mesh')
-        gt_ind = voxelize_mesh(gt_mesh.apply_transform(trimesh.transformations.euler_matrix(0, np.pi/2,0)))
+        # gt_mesh = trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{model_id}/models/model_normalized.obj", force='mesh')
+        # gt_ind = voxelize_mesh(gt_mesh.apply_transform(trimesh.transformations.euler_matrix(0, np.pi/2,0)))
 
-        # gt_ind = \
-        #     grids_val[cat_id, model_id]
+        gt_ind = \
+            grids_val[cat_id, model_id]
         
         pred_ind_1d = np.unique(np.ravel_multi_index(
             multi_index=(pred_ind[:, 0], pred_ind[:, 1], pred_ind[:, 2]),
@@ -597,9 +615,404 @@ def compare_ious(oracle_retrieval=False):
     print(np.mean(ious))
     print(np.median(ious))
     print(len(ious[ious > 0.5]))
+    print(exact)
     return ious
     # with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/scan2cad_val_top5_ret.json', 'w') as t5f:
     #     json.dump(top5_gt, t5f)
+
+def compare_f1():
+    from pytorch3d.io import load_obj
+    def get_source_latent_codes_encoder(source_labels, SOURCE_MODEL_INFO, retrieval_encoder, device):
+        # print("Using encoder to get source latent codes.")
+        source_points = []
+
+        # start_tm = time.time()
+        for source_label in source_labels:
+            src_points = SOURCE_MODEL_INFO[source_label]["points"]	
+            source_points.append(src_points)
+        # ret_tm = time.time()
+        # print("Load from labels time: ", ret_tm - start_tm)
+        # print("Num labels: ", source_labels.shape)
+        source_points = np.array(source_points)
+        source_points = torch.from_numpy(source_points).to(device, dtype=torch.float)
+
+        src_latent_codes = retrieval_encoder(source_points)
+        # print("Retrieval encoding time: ", time.time() - ret_tm)
+        return src_latent_codes
+
+    JOINT_BASE_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/'
+    JOINT_SRC_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/data/roca_sources_centroid/chair/h5'
+    JOINT_MODEL_PATH = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/log/chair522_partial/model.pth'
+    filename_pickle = JOINT_BASE_DIR+"data/generated_datasplits/chair_522_roca.pickle"
+    with open(filename_pickle, 'rb') as handle:
+        sources = pickle.load(handle)['sources']
+    src_data_fol = JOINT_SRC_DIR
+    MAX_NUM_PARAMS = -1
+    MAX_NUM_PARTS = -1
+    device = 'cuda'
+    SOURCE_MODEL_INFO = []
+    print("Loading joint sources...")
+    with open("/home/karacam/Thesis/joint_learning_retrieval_deformation/shape2part_ext.json", 'r') as f:
+        shape2part = json.load(f)
+    part2shape = dict([(value, key) for key, value in shape2part['chair']['model_names'].items()])
+
+    for i in range(len(sources)):
+        source_model = sources[i]
+        src_filename = str(source_model) + "_leaves.h5"
+
+        default_param, points, point_labels, points_mat, \
+                    constraint_mat,	constraint_proj_mat	= get_model(src_data_fol + '/' + src_filename, constraint=True)
+
+        curr_source_dict = {}
+        curr_source_dict["default_param"] = default_param
+        curr_source_dict["points"] = points
+        curr_source_dict["point_labels"] = point_labels
+        curr_source_dict["points_mat"] = points_mat
+        curr_source_dict["model_id"] = (shape2part['chair']['synsetid'], part2shape[str(source_model)])
+
+        curr_source_dict["constraint_mat"] = constraint_mat
+        curr_source_dict["constraint_proj_mat"] = constraint_proj_mat
+        _, curr_source_dict["vertices_mat"], curr_source_dict["faces"], _ = get_model(os.path.join(src_data_fol, src_filename), pred=True)
+
+        # Get number of parts of the model
+        num_parts = len(np.unique(point_labels))
+        curr_source_dict["num_parts"] = num_parts
+
+        curr_num_params = default_param.shape[0]
+        if (MAX_NUM_PARAMS < curr_num_params):
+            MAX_NUM_PARAMS = curr_num_params
+            MAX_NUM_PARTS = int(MAX_NUM_PARAMS/6)
+
+        SOURCE_MODEL_INFO.append(curr_source_dict)
+    print("Done loading joint sources.")
+    embedding_size = 6
+    TARGET_LATENT_DIM = 256
+    SOURCE_LATENT_DIM = 256
+    PART_LATENT_DIM = 32
+    target_encoder = TargetEncoder(
+        TARGET_LATENT_DIM,
+        3,
+    )
+    decoder_input_dim = TARGET_LATENT_DIM + SOURCE_LATENT_DIM + PART_LATENT_DIM
+    param_decoder = ParamDecoder2(decoder_input_dim, 256, embedding_size)
+    retrieval_encoder = TargetEncoder(
+        TARGET_LATENT_DIM,
+        3,
+    )
+
+    _model = torch.load(JOINT_MODEL_PATH)
+    target_encoder.load_state_dict(_model["target_encoder"])
+    target_encoder.to(device)
+    target_encoder.eval()
+
+    param_decoder.load_state_dict(_model["param_decoder"])
+    param_decoder.to(device)
+    param_decoder.eval()
+
+    retrieval_encoder.load_state_dict(_model["retrieval_encoder"])
+    retrieval_encoder.to(device)
+    retrieval_encoder.eval()
+
+    SOURCE_LATENT_CODES = _model["source_latent_codes"].detach()
+    SOURCE_PART_LATENT_CODES = [_x.detach() for _x in _model["part_latent_codes"]]
+    SOURCE_VARIANCES = _model["source_variances"].detach()
+
+    source_labels = torch.arange(len(SOURCE_MODEL_INFO))#.repeat(10)
+    src_latent_codes = torch.gather(SOURCE_LATENT_CODES, 0, source_labels.to(device).unsqueeze(-1).repeat(1,SOURCE_LATENT_CODES.shape[-1]))
+
+    with torch.no_grad():
+        ret_src_latent_codes = []
+        num_sets = 20
+        interval = int(len(source_labels)/num_sets)
+
+        for j in range(num_sets):
+            if (j==num_sets-1):
+                curr_src_latent_codes = get_source_latent_codes_encoder(source_labels[j*interval:], SOURCE_MODEL_INFO, retrieval_encoder, device)
+            else:
+                curr_src_latent_codes = get_source_latent_codes_encoder(source_labels[j*interval:(j+1)*interval], SOURCE_MODEL_INFO, retrieval_encoder, device)
+            ret_src_latent_codes.append(curr_src_latent_codes)
+
+        ret_src_latent_codes = torch.cat(ret_src_latent_codes)
+    
+    with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/points_val.pkl', 'rb') as f:
+        points_val = pickle.load(f)
+    with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/val_grids_32.pkl', 'rb') as f:
+        grids_val = pickle.load(f)
+    assert len({ps['id_cad'] for ps in points_val}) == len(points_val)
+    tar_pcs = {(ps['catid_cad'],ps['id_cad']):ps['points'] for ps in points_val}
+
+    exact = 0
+    pred_meshes = []
+    gt_meshes = []
+    for cat_id, model_id in tqdm(tar_pcs):
+        # tar_pc_np = mesh.sample(1024)
+        tar_pc = tar_pcs[cat_id, model_id]
+        # tar_pc = tar_pc[tar_pc[:,0] > 0]
+        try:
+            with open(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{model_id}/models/model_normalized.json", 'r') as jf:
+                _meta = json.load(jf)
+            # tar_mesh = trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{model_id}/models/model_normalized.obj", force='mesh')
+        except FileNotFoundError:
+            print("MODEL NOT FOUND!?!?")
+
+        tar_pc = torch.from_numpy(tar_pc).unsqueeze(0).to(device, dtype=torch.float)
+        tar_pc.requires_grad = False
+        
+        retrieval_latent_codes = retrieval_encoder(tar_pc)
+        retrieval_latent_codes = retrieval_latent_codes.unsqueeze(0).repeat(len(SOURCE_MODEL_INFO),1,1)
+        # retrieval_latent_codes = retrieval_latent_codes.view(-1, retrieval_latent_codes.shape[-1])	
+        retrieval_latent_codes = retrieval_latent_codes.view(len(SOURCE_MODEL_INFO), -1, TARGET_LATENT_DIM)
+        with torch.no_grad():
+            source_labels = source_labels
+            _src_latent_codes = ret_src_latent_codes.view(len(SOURCE_MODEL_INFO), -1, SOURCE_LATENT_DIM)
+
+            src_variances = get_source_latent_codes_fixed(source_labels, SOURCE_VARIANCES, device=device)
+            src_variances = src_variances.view(len(SOURCE_MODEL_INFO), -1, SOURCE_LATENT_DIM)
+
+        distances = compute_mahalanobis(retrieval_latent_codes, _src_latent_codes, src_variances, activation_fn=torch.sigmoid)
+        sorted_indices = torch.argsort(distances, dim=0)
+        retrieved_idx = sorted_indices[0,:]
+
+        target_latent_codes = target_encoder(tar_pc)
+        concat_latent_code = torch.cat((src_latent_codes[retrieved_idx], target_latent_codes), dim=1)
+
+        curr_num_parts = SOURCE_MODEL_INFO[retrieved_idx]["num_parts"]
+        curr_code = concat_latent_code[0]
+        curr_code_repeated = curr_code.view(1,curr_code.shape[0]).repeat(curr_num_parts, 1)
+        
+        part_latent_codes = SOURCE_PART_LATENT_CODES[retrieved_idx]
+
+        full_latent_code = torch.cat((curr_code_repeated, part_latent_codes), dim=1)
+
+        params = param_decoder(full_latent_code, use_bn=False)
+
+        ## Pad with extra zero rows to cater to max number of parameters
+        if (curr_num_parts < MAX_NUM_PARTS):
+            dummy_params = torch.zeros((MAX_NUM_PARTS-curr_num_parts, embedding_size), dtype=torch.float, device=device)
+            params = torch.cat((params, dummy_params), dim=0)
+
+        params = params.view(-1, 1)
+        pred_params = params.detach().cpu().numpy()
+        curr_param = np.expand_dims(pred_params, -1)
+        curr_mat, curr_default_param, curr_conn_mat = get_source_info_mesh(SOURCE_MODEL_INFO[retrieved_idx[0]]["vertices_mat"], SOURCE_MODEL_INFO[retrieved_idx[0]]["default_param"], SOURCE_MODEL_INFO[retrieved_idx[0]]["constraint_proj_mat"], curr_param.shape[0])
+
+        output_vertices = get_shape_numpy(curr_mat, curr_param, curr_default_param.T, connectivity_mat=curr_conn_mat)
+        mesh = trimesh.Trimesh(
+            vertices=output_vertices,
+            faces=SOURCE_MODEL_INFO[retrieved_idx[0]]["faces"]
+        )
+        pred_meshes.append((mesh.vertices, mesh.faces))
+        gt_mesh = trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{model_id}/models/model_normalized.obj", force='mesh')
+        gt_meshes.append((gt_mesh.vertices, gt_mesh.faces))
+        ret_id = SOURCE_MODEL_INFO[retrieved_idx[0]]['model_id'][1]
+        if ret_id == model_id:
+            exact +=1 
+    pred_meshes = Meshes([torch.from_numpy(m[0]).type(torch.float) for m in pred_meshes], [torch.from_numpy(m[1]).type(torch.float) for m in pred_meshes])
+    gt_meshes = Meshes([torch.from_numpy(m[0]).type(torch.float) for m in gt_meshes], [torch.from_numpy(m[1]).type(torch.float) for m in gt_meshes])
+    print("Comparing meshes...")
+    metrics = compare_meshes(pred_meshes, gt_meshes)
+    print("Done")
+    print(metrics)
+    # print(len(ious[ious > 0.5]))
+    print(exact)
+    # with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/scan2cad_val_top5_ret.json', 'w') as t5f:
+    #     json.dump(top5_gt, t5f)
+
+def get_all_emds(normalize = False, norm_method = None):
+    with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/train_grids_32.pkl', 'rb') as f:
+        train_objs = list(pickle.load(f).keys())
+    with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/val_grids_32.pkl', 'rb') as f:
+        val_objs = list(pickle.load(f).keys())
+    
+    print("Loading train objs...")
+    train_meshes = {}
+    train_sampled = {}
+    for cat_id, model_id in train_objs:
+        mesh = trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v2/{cat_id}/{model_id}/models/model_normalized.obj", force='mesh')
+        if normalize:
+            if norm_method == "iso_norm":
+                m_edge = np.argmax(mesh.bounds[1] - mesh.bounds[0])
+                mesh.vertices = (mesh.vertices - mesh.bounds[0,m_edge]) / (mesh.bounds[1, m_edge] - mesh.bounds[0, m_edge])
+            else:
+                mmin, mmax = mesh.bounds
+                mesh.vertices[:,0] = (mesh.vertices[:,0] - mmin[0]) / (mmax[0] - mmin[0])
+                mesh.vertices[:,1] = (mesh.vertices[:,1] - mmin[1]) / (mmax[1] - mmin[1])
+                mesh.vertices[:,2] = (mesh.vertices[:,2] - mmin[2]) / (mmax[2] - mmin[2])
+        mesh.apply_translation(-mesh.bounds.sum(axis=0)/2.)
+        train_meshes[cat_id, model_id] = mesh
+        train_sampled[cat_id, model_id] = trimesh.sample.sample_surface_even(mesh, 1024)[0]
+    
+    print("Loading validation objs...")
+    val_meshes = []
+    val_sampled = []
+    for cat_id, model_id in val_objs:
+        mesh = trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v2/{cat_id}/{model_id}/models/model_normalized.obj", force='mesh')
+        if normalize:
+            if norm_method == "iso_norm":
+                m_edge = np.argmax(mesh.bounds[1] - mesh.bounds[0])
+                mesh.vertices = (mesh.vertices - mesh.bounds[0,m_edge]) / (mesh.bounds[1, m_edge] - mesh.bounds[0, m_edge])
+            else:
+                mmin, mmax = mesh.bounds
+                mesh.vertices[:,0] = (mesh.vertices[:,0] - mmin[0]) / (mmax[0] - mmin[0])
+                mesh.vertices[:,1] = (mesh.vertices[:,1] - mmin[1]) / (mmax[1] - mmin[1])
+                mesh.vertices[:,2] = (mesh.vertices[:,2] - mmin[2]) / (mmax[2] - mmin[2])
+        mesh.apply_translation(-mesh.bounds.sum(axis=0)/2.)
+        val_meshes.append(mesh)
+        val_sampled.append(trimesh.sample.sample_surface_even(mesh, 1024)[0])
+    
+    print("Getting EMD scores...")
+    all_emds = {}
+    # for id_t, verts_t in tqdm(train_sampled.items()):
+    def _cmp(id_t, verts_t):
+        emds_per_t = []
+        for verts_v in val_sampled:
+            emds_per_t.append(earth_movers_distance(verts_t, verts_v)[0])
+        emds_per_t = np.asarray(emds_per_t)
+        return (id_t, emds_per_t)
+        # all_emds[id_t] = (id_t, {'scores': emds_per_t})
+    num_cores = int(0.4 * multiprocessing.cpu_count())
+    # all_emds['scores'] = Parallel(n_jobs=num_cores)(delayed(_cmp)(id_t, verts_t) for id_t, verts_t in tqdm(train_sampled.items()))
+    all_emds['scores'] = {}
+    [all_emds['scores'].update({_id: _scrs}) for _id, _scrs in Parallel(n_jobs=num_cores)(delayed(_cmp)(id_t, verts_t) for id_t, verts_t in tqdm(train_sampled.items()))]
+    all_emds['val_ids'] = val_objs
+
+    print("Dumping results...")
+    if normalize:
+        if norm_method == "iso_norm":
+            with open("all_emds_train2val_iso-norm.pkl", 'wb') as f:
+                pickle.dump(all_emds, f)
+        else:
+            with open("all_emds_train2val_norm.pkl", 'wb') as f:
+                pickle.dump(all_emds, f)
+    else:
+        with open("all_emds_train2val.pkl", 'wb') as f:
+            pickle.dump(all_emds, f)
+    print("Done!")
+    return
+
+def get_all_metrics(normalize = False, norm_method = None):
+    with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/train_grids_32.pkl', 'rb') as f:
+        train_objs = list(pickle.load(f).keys())
+    with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/val_grids_32.pkl', 'rb') as f:
+        val_objs = list(pickle.load(f).keys())
+    
+    print("Loading train objs...")
+    train_meshes = {}
+    for cat_id, model_id in train_objs:
+        mesh = trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v2/{cat_id}/{model_id}/models/model_normalized.obj", force='mesh')
+        if normalize:
+            if norm_method == "iso_norm":
+                m_edge = np.argmax(mesh.bounds[1] - mesh.bounds[0])
+                mesh.vertices = (mesh.vertices - mesh.bounds[0,m_edge]) / (mesh.bounds[1, m_edge] - mesh.bounds[0, m_edge])
+            else:
+                mmin, mmax = mesh.bounds
+                mesh.vertices[:,0] = (mesh.vertices[:,0] - mmin[0]) / (mmax[0] - mmin[0])
+                mesh.vertices[:,1] = (mesh.vertices[:,1] - mmin[1]) / (mmax[1] - mmin[1])
+                mesh.vertices[:,2] = (mesh.vertices[:,2] - mmin[2]) / (mmax[2] - mmin[2])
+
+        mesh.apply_translation(-mesh.bounds.sum(axis=0)/2.)
+        train_meshes[cat_id, model_id] = mesh
+    
+    print("Loading validation objs...")
+    val_meshes = []
+    for cat_id, model_id in val_objs:
+        mesh = trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v2/{cat_id}/{model_id}/models/model_normalized.obj", force='mesh')
+        if normalize:
+            if norm_method == "iso_norm":
+                m_edge = np.argmax(mesh.bounds[1] - mesh.bounds[0])
+                mesh.vertices = (mesh.vertices - mesh.bounds[0,m_edge]) / (mesh.bounds[1, m_edge] - mesh.bounds[0, m_edge])
+            else:
+                mmin, mmax = mesh.bounds
+                mesh.vertices[:,0] = (mesh.vertices[:,0] - mmin[0]) / (mmax[0] - mmin[0])
+                mesh.vertices[:,1] = (mesh.vertices[:,1] - mmin[1]) / (mmax[1] - mmin[1])
+                mesh.vertices[:,2] = (mesh.vertices[:,2] - mmin[2]) / (mmax[2] - mmin[2])
+        mesh.apply_translation(-mesh.bounds.sum(axis=0)/2.)
+        val_meshes.append(mesh)
+    
+    print("Getting F1 scores...")
+    all_metrics = {'scores':{}}
+    for id_t, mesh_t in tqdm(train_meshes.items()):
+    # def _cmp(id_t, mesh_t):
+        # f1s_per_t = []
+        pred_meshes = Meshes([torch.from_numpy(mesh_t.vertices).type(torch.float)]*len(val_meshes),
+                             [torch.from_numpy(mesh_t.faces).type(torch.float)]*len(val_meshes)).to('cuda')
+        gt_meshes = Meshes([torch.from_numpy(mesh_v.vertices).type(torch.float) for mesh_v in val_meshes],
+                           [torch.from_numpy(mesh_v.faces).type(torch.float) for mesh_v in val_meshes]).to('cuda')
+        metrics = compare_meshes(pred_meshes, gt_meshes, reduce=False)
+        metrics = {k: v.numpy() for k, v in metrics.items()}
+        all_metrics['scores'].update({id_t: metrics})
+    all_metrics['val_ids'] = val_objs
+    print("Dumping results...")
+    if normalize:
+        if norm_method == "iso_norm":
+            with open("all_metrics_train2val_iso-norm.pkl", 'wb') as f:
+                pickle.dump(all_metrics, f)
+        else:
+            with open("all_metrics_train2val_norm.pkl", 'wb') as f:
+                pickle.dump(all_metrics, f)
+    else:
+        with open("all_metrics_train2val.pkl", 'wb') as f:
+            pickle.dump(all_metrics, f)
+    print("Done!")
+    return
+
+def compare_src_ious():
+    JOINT_BASE_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/'
+    JOINT_SRC_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/data/roca_sources_part_thresh_32_1024p_v2/chair/h5'
+    filename_pickle = JOINT_BASE_DIR+"data/generated_datasplits/chair_519_roca_v2.pickle"
+    with open(filename_pickle, 'rb') as handle:
+        sources = pickle.load(handle)['sources']
+    src_data_fol = JOINT_SRC_DIR
+
+    with open("/home/karacam/Thesis/joint_learning_retrieval_deformation/shape2part_ext.json", 'r') as f:
+        shape2part = json.load(f)
+    part2shape = dict([(value, key) for key, value in shape2part['chair']['model_names'].items()])
+    with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/train_grids_32.pkl', 'rb') as f:
+        grids_train = pickle.load(f)
+
+    def _cmp(source_model):
+        src_filename = str(source_model) + "_leaves.h5"
+
+        with h5py.File(src_data_fol + '/' + src_filename, 'r') as f:
+            vertices = f["vertices"][:]
+            faces = f["faces"][:]
+        model_id = (shape2part['chair']['synsetid'], part2shape[str(source_model)])
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+
+        pred_ind = voxelize_mesh(mesh)
+        # gt_mesh = trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{model_id}/models/model_normalized.obj", force='mesh')
+        # gt_ind = voxelize_mesh(gt_mesh.apply_transform(trimesh.transformations.euler_matrix(0, np.pi/2,0)))
+
+        gt_ind = \
+            grids_train[model_id]
+        
+        pred_ind_1d = np.unique(np.ravel_multi_index(
+            multi_index=(pred_ind[:, 0], pred_ind[:, 1], pred_ind[:, 2]),
+            dims=(32, 32, 32)
+        ))
+
+        gt_ind_1d = np.unique(np.ravel_multi_index(
+            multi_index=(gt_ind[:, 0], gt_ind[:, 1], gt_ind[:, 2]),
+            dims=(32, 32, 32)
+        ))
+        inter = np.intersect1d(pred_ind_1d, gt_ind_1d).size
+        union = pred_ind_1d.size + gt_ind_1d.size - inter
+
+        iou = inter / union
+        return iou
+
+    num_cores = int(0.4 * multiprocessing.cpu_count())
+    ious = Parallel(n_jobs=num_cores)(delayed(_cmp)(source_model) for source_model in tqdm(sources))
+    ious = np.asarray(ious)
+    print(np.min(ious))
+    print(np.max(ious))
+    print(np.mean(ious))
+    print(np.median(ious))
+    print(len(ious[ious > 0.5]))
+    return ious
+    # with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/scan2cad_val_top5_ret.json', 'w') as t5f:
+    #     json.dump(top5_gt, t5f)
+
 def process_top5_gt():
     def get_source_latent_codes_encoder(source_labels, SOURCE_MODEL_INFO, retrieval_encoder, device):
         # print("Using encoder to get source latent codes.")
@@ -620,9 +1033,9 @@ def process_top5_gt():
         return src_latent_codes
 
     JOINT_BASE_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/'
-    JOINT_SRC_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/data/roca_sources_part_thresh_32_1024p_v2/chair/h5'
-    JOINT_MODEL_PATH = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/log/chair519_1024p_v2/model.pth'
-    filename_pickle = JOINT_BASE_DIR+"data/generated_datasplits/chair_519_roca_v2.pickle"
+    JOINT_SRC_DIR = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/data/roca_sources_centroid/chair/h5'
+    JOINT_MODEL_PATH = '/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/log/chair522_partial/model.pth'
+    filename_pickle = JOINT_BASE_DIR+"data/generated_datasplits/chair_522_roca.pickle"
     with open(filename_pickle, 'rb') as handle:
         sources = pickle.load(handle)['sources']
     src_data_fol = JOINT_SRC_DIR
@@ -727,6 +1140,62 @@ def process_top5_gt():
     with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/scan2cad_val_top5_ret.json', 'w') as t5f:
         json.dump(top5_gt, t5f)
 
+def sample_render_targets():
+    with open("/home/karacam/Thesis/joint_learning_retrieval_deformation/shape2part_ext.json", 'r') as f:
+        shape2part = json.load(f)
+    part2shape = dict([(value, key) for key, value in shape2part['chair']['model_names'].items()])
+
+    target_data_fol = os.path.join("/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/data", "roca_targets_part_thresh_32_1024p_v1", "chair", "h5")
+    shapenet_root_dir = '/mnt/noraid/karacam/ShapeNetCore.v2/03001627/'
+    out_dir = os.path.join("/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/data", "roca_targets_partial")
+    if not os.path.exists(out_dir):
+        os.mkdir(out_dir)
+        os.mkdir(os.path.join(out_dir, 'chair'))
+        os.mkdir(os.path.join(out_dir, 'chair', 'h5'))
+    num_cores = int(0.4 * multiprocessing.cpu_count())
+    #for tar in tqdm(os.listdir(target_data_fol)):
+    def _tmp(fname):
+        partid = fname.split('_')[0]
+        try:
+            shapeid = part2shape[partid]
+        except KeyError:
+            return
+        try:
+            mesh = trimesh.load(os.path.join(shapenet_root_dir, shapeid, "models/model_normalized.obj"), force='mesh')
+        except ValueError:
+            return
+        mesh.apply_translation(-mesh.bounds.sum(axis=0)/2.)
+        # mesh.apply_transform(trimesh.transformations.euler_matrix(0, np.pi, 0))
+        for i in range(4):
+            rnd_trs = trimesh.transformations.euler_matrix(np.random.ranf((1,))*np.pi/3, np.random.ranf((1,))*np.pi, 0)
+            mesh.apply_transform(rnd_trs)
+            pc = render_and_unproject(mesh.vertices, mesh.faces)
+            if pc.shape[0] < 1024:
+                pc = np.concatenate((pc, np.zeros((1024-pc.shape[0], 3))))
+            else:
+                pc = np.random.permutation(pc)[:1024]
+            pc = trimesh.transform_points(pc, np.linalg.inv(rnd_trs))
+            mesh.apply_transform(np.linalg.inv(rnd_trs))
+            # trimesh.PointCloud(pc).export('tst_pc.ply')
+            # mesh.export('tst_mesh.obj')
+            # exit()
+            assert (pc.shape == (1024,3))
+            out_h5_file = os.path.join(out_dir, 'chair', "h5", str(partid)+'_'+str(i)+'_leaves.h5')
+            select_keys = ['vertex_labels', 'face_labels', 'point_labels', 'vertices_mat',
+                'points_mat','default_param',
+                'point_semantic', 'vertex_semantic']      
+            with h5py.File(out_h5_file, 'w') as f:
+                f.create_dataset('box_params', data=[], compression="gzip")
+                f.create_dataset('orig_ids', data=[partid], compression="gzip")
+                f.create_dataset('semantic_label', data=[0], compression="gzip")
+                f.create_dataset('points', data=pc, compression="gzip")
+                f.create_dataset('vertices', data=mesh.vertices, compression="gzip")
+                f.create_dataset('faces', data=mesh.faces, compression="gzip")
+                for key in select_keys:
+                    f.create_dataset(key, data=[], compression="gzip")
+    Parallel(n_jobs=num_cores)(delayed(_tmp)(fname) for fname in tqdm(os.listdir(target_data_fol)))
+    # [_tmp(fname) for fname in os.listdir(target_data_fol)]
+
 def get_source_info_mesh(points_mat, default_param, constraint_proj_mat, max_num_params, use_connectivity=True):
     padded_mat = np.zeros((points_mat.shape[0], max_num_params))
     padded_mat[0:points_mat.shape[0], 0:points_mat.shape[1]] = points_mat
@@ -791,10 +1260,456 @@ def create_grid_points_from_xyz_bounds(min_x, max_x, min_y, max_y ,min_z, max_z,
     del X, Y, Z, x
     return points_list
 
+def EMD(p, q, p_norm=2, eps=1e-4, max_iters=100, stop_thresh=1e-3):
+    M = pairwise_distances(p, q, p_norm)
+    a = np.ones(p.shape[0], dtype="float32") / p.shape[0]
+    b = np.ones(q.shape[0], dtype="float32") / q.shape[0]
+    P = sinkhorn(a, b, M, eps, max_iters, stop_thresh)
+    return ((P * M).sum(), P)
+
+def render_image_from_mesh(vertices, faces, device='cuda'):
+    R, T = look_at_view_transform(3)
+    cameras = FoVPerspectiveCameras(device=device, R=R, T=T)
+    raster_settings = RasterizationSettings(
+        image_size=256,
+        blur_radius=0.0,
+        faces_per_pixel=1,
+        bin_size=0
+    )
+    renderer = MeshRenderer(
+        rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings),
+        shader=SoftPhongShader(device=device, cameras=cameras)
+    )
+    if type(vertices) is not torch.Tensor:
+        vertices = torch.from_numpy(vertices).type(torch.float)
+    if type(faces) is not torch.Tensor:
+        faces = torch.from_numpy(faces).type(torch.float)
+    vertices = vertices.to(device)
+    faces = faces.to(device)
+
+    mesh = Meshes([vertices], [faces])
+    color = torch.ones(1, vertices.size(0), 3, device=device)
+    mesh.textures = TexturesVertex(verts_features=color)
+    img = renderer(mesh)
+    img = (img.detach().cpu().numpy()[0] * 255).astype('uint8')
+
+    return img
+
+def render_and_unproject(vertices, faces, device='cuda'):
+    # R, T = look_at_view_transform(1, torch.rand(1)*60, torch.rand(1)*360)
+    R, T = look_at_view_transform(1)
+    img_size = 256
+    cx = cy = fx = fy = img_size / 2.
+    cameras = PerspectiveCameras(device=device, R=R, T=T, focal_length=((fx,fy),), image_size=((img_size,img_size),), principal_point=((cx,cy),), in_ndc=False)
+    raster_settings = RasterizationSettings(
+        image_size=256,
+        blur_radius=0.0,
+        faces_per_pixel=1,
+        bin_size=0
+    )
+
+    rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings)
+    renderer = MeshRenderer(
+        rasterizer=rasterizer,
+        shader=SoftPhongShader(device=device, cameras=cameras)
+    )
+    if type(vertices) is not torch.Tensor:
+        vertices = torch.from_numpy(vertices).type(torch.float)
+    if type(faces) is not torch.Tensor:
+        faces = torch.from_numpy(faces).type(torch.float)
+    vertices = vertices.to(device)
+    faces = faces.to(device)
+
+    mesh = Meshes([vertices], [faces])
+    color = torch.ones(1, vertices.size(0), 3, device=device)
+    mesh.textures = TexturesVertex(verts_features=color)
+    img = renderer(mesh)
+    fragments = rasterizer(mesh)
+    depth = fragments.zbuf.squeeze(-1)
+    # _img = (img.detach().cpu().numpy()[0] * 255).astype('uint8')
+    # _img = Image.fromarray(_img).convert('RGB')
+    # _img.save('tst_render.png')
+    # _img.close()
+
+    yy, xx = torch.meshgrid(torch.arange(img.shape[2]-1, -1, -1), torch.arange(img.shape[2]-1, -1, -1))
+    xx = xx.to(device)
+    yy = yy.to(device)
+
+    xy_depth = torch.stack([xx,yy,depth[0]], dim=-1)
+    # _img = Image.fromarray((xy_depth.cpu().numpy()*255).astype('uint8')).convert('RGB')
+    # _img.save('tst_depth.png')
+    # _img.close()
+
+    xy_depth = xy_depth[xy_depth[:,:,2] > -1]
+    pc = cameras.unproject_points(xy_depth)
+    # print(torch.cat([pc, torch.ones((pc.shape[0],1)).to(device)], dim=-1) @ TRS[0].inverse())
+
+    pc = pc.cpu().numpy()
+    # pc = (pc @ R[0].numpy())
+
+    return pc
+
+def image_grid(imgs, rows, cols):
+    # assert len(imgs) == rows*cols
+
+    w, h = imgs[0].size
+    dw, dh = (256,256)
+    grid = Image.new('RGB', size=(cols*dw, rows*dh))
+    
+    for i, img in enumerate(imgs):
+        im = img.crop(((w-h)//2, 0, w-((w-h)//2), h))
+        im = im.resize((dw,dh), Image.ANTIALIAS)
+        grid.paste(im, box=(i%cols*dw, i//cols*dh))
+    return grid
+
+def get_logs_emd():
+    shapenet_root_dir = '/mnt/noraid/karacam/ShapeNetCore.v2/'
+
+    with open("all_emds_train2val.pkl", 'rb') as f:
+        all_emds = pickle.load(f)
+    with open("all_metrics_train2val.pkl", 'rb') as f:
+        all_metrics = pickle.load(f)
+
+    with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/val_grids_32.pkl', 'rb') as f:
+        grids_val = pickle.load(f)
+    with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/train_grids_32.pkl', 'rb') as f:
+        grids_train = pickle.load(f)
+
+    train_ids = list(all_emds['scores'].keys())
+    trains_in_val = [id_t for id_t in train_ids if id_t in all_emds['val_ids']]
+    trains_not_in_val = [id_t for id_t in train_ids if id_t not in all_emds['val_ids']]
+    trains_in_val = np.asarray(trains_in_val)
+    trains_not_in_val = np.asarray(trains_not_in_val)
+
+    val_ids = np.asarray(all_emds['val_ids'])
+    assert (val_ids == np.asarray(all_metrics['val_ids'])).all()
+
+    rnd_trains = np.concatenate((trains_in_val[np.random.choice(len(trains_in_val), 10, replace=False)], 
+                    trains_not_in_val[np.random.choice(len(trains_not_in_val), 10, replace=False)]))
+
+    # f1s_thresh = {
+    #     0.1 : [5, 10, 15, 20, 50, 75], 
+    #     0.3 : [20, 40, 60, 80], 
+    #     0.5 : [20, 40, 60, 80],
+    # }
+    thresh = 0.02
+
+    out_dir = 'testing'
+
+    # for _f1t, _f1hs in f1s_thresh.items():
+    #     print(f"*** F1 Threshold: {_f1t} ***")
+    # for _f1h in _f1hs:
+    #     print(f"*** F1 Hyper: {_f1h} ***")
+    for i in range(10):
+        thresh += 5e-3
+        to_grid_emd_imgs = []
+        to_grid_f1_imgs = []
+        for i, (cat_id, model_id) in enumerate(rnd_trains):
+            print(f"Processing {i+1} of {rnd_trains.shape[0]}...")
+            mesh_src = trimesh.load(os.path.join(shapenet_root_dir, cat_id, model_id, "models/model_normalized.obj"), force='mesh')
+            mesh_src.apply_translation(-mesh_src.bounds.sum(axis=0)/2.)
+            mesh_src.apply_transform(trimesh.transformations.euler_matrix(0, np.pi, 0))
+
+            img_src = Image.fromarray(render_image_from_mesh(mesh_src.vertices, mesh_src.faces)).convert('RGB')
+            to_grid_emd_imgs.append(img_src)
+            to_grid_f1_imgs.append(img_src)
+
+            arr_emd = all_emds['scores'][cat_id, model_id]
+            _over_thresh = arr_emd < thresh
+            arr_emd = arr_emd[_over_thresh]
+            sorted_arr_idx = np.argsort(arr_emd)
+
+            if len(arr_emd) < 10:
+                _idx = sorted_arr_idx
+            else:
+                _idx = sorted_arr_idx[:5]
+                _idx = np.concatenate((_idx, sorted_arr_idx[-5:]))
+            close_10_dists = arr_emd[_idx]
+            # print("F1 scores: ", close_10_dists)
+            log = f"> {i+1}: {close_10_dists.tolist()}\n"
+            with open(os.path.join(out_dir, f"scores_emd_{thresh:.3f}.log"), 'a') as f:
+                f.write(log)
+
+            for cat_id_val, model_id_val in val_ids[_over_thresh][_idx]:
+                mesh_val = trimesh.load(os.path.join(shapenet_root_dir, cat_id_val, model_id_val, "models/model_normalized.obj"), force='mesh')
+                mesh_val.apply_translation(-mesh_val.bounds.sum(axis=0)/2.)
+                mesh_val.apply_transform(trimesh.transformations.euler_matrix(0, np.pi, 0))
+                img_val = Image.fromarray(render_image_from_mesh(mesh_val.vertices, mesh_val.faces)).convert('RGB')
+                to_grid_emd_imgs.append(img_val)
+            if len(arr_emd) < 10:
+                for _ in range(10-len(arr_emd)):
+                    img_val = Image.fromarray(np.zeros((256,256,3), dtype='uint8')).convert('RGB')
+                    to_grid_emd_imgs.append(img_val)
+        grid = image_grid(to_grid_emd_imgs, rows=len(rnd_trains), cols=11)
+        grid.save(os.path.join(out_dir, f'img_grid_emds_{thresh:.3f}.png'))
+        grid.close()
+        for img in to_grid_emd_imgs: img.close()
+
+def get_logs_f1(normalize = False, norm_method = None):
+    shapenet_root_dir = '/mnt/noraid/karacam/ShapeNetCore.v2/'
+
+    if normalize:
+        if norm_method == "iso_norm":
+            with open("all_metrics_train2val_iso-norm.pkl", 'rb') as f:
+                all_metrics = pickle.load(f)
+        else:
+            with open("all_metrics_train2val_norm.pkl", 'rb') as f:
+                all_metrics = pickle.load(f)
+    else:
+        with open("all_metrics_train2val.pkl", 'rb') as f:
+            all_metrics = pickle.load(f)
+
+    with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/val_grids_32.pkl', 'rb') as f:
+        grids_val = pickle.load(f)
+    with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/train_grids_32.pkl', 'rb') as f:
+        grids_train = pickle.load(f)
+
+    train_ids = list(all_metrics['scores'].keys())
+    trains_in_val = [id_t for id_t in train_ids if id_t in all_metrics['val_ids']]
+    trains_not_in_val = [id_t for id_t in train_ids if id_t not in all_metrics['val_ids']]
+    trains_in_val = np.asarray(trains_in_val)
+    trains_not_in_val = np.asarray(trains_not_in_val)
+
+    val_ids = np.asarray(all_metrics['val_ids'])
+    assert (val_ids == np.asarray(all_metrics['val_ids'])).all()
+
+    rnd_trains = np.concatenate((trains_in_val[np.random.choice(len(trains_in_val), 10, replace=False)], 
+                    trains_not_in_val[np.random.choice(len(trains_not_in_val), 10, replace=False)]))
+
+    f1s_thresh = {
+        0.1 : [5, 10, 15, 20, 50, 75], 
+        0.3 : [20, 40, 60, 80], 
+        0.5 : [20, 40, 60, 80],
+    }
+
+    out_dir = 'testing'
+    if normalize:
+        if norm_method == "iso_norm":
+            out_dir = os.path.join(out_dir, 'iso_norm')
+            if not os.path.exists(out_dir):
+                os.mkdir(out_dir)
+        else:
+            out_dir = os.path.join(out_dir, 'norm')
+            if not os.path.exists(out_dir):
+                os.mkdir(out_dir)
+
+
+    for _f1t, _f1hs in f1s_thresh.items():
+        print(f"*** F1 Threshold: {_f1t} ***")
+        for _f1h in _f1hs:
+            print(f"*** F1 Hyper: {_f1h} ***")
+            to_grid_f1_imgs = []
+            for i, (cat_id, model_id) in enumerate(rnd_trains):
+                print(f"Processing {i+1} of {rnd_trains.shape[0]}...")
+                mesh_src = trimesh.load(os.path.join(shapenet_root_dir, cat_id, model_id, "models/model_normalized.obj"), force='mesh')
+                if normalize:
+                    if norm_method == "iso_norm":
+                        m_edge = np.argmax(mesh_src.bounds[1] - mesh_src.bounds[0])
+                        mesh_src.vertices = (mesh_src.vertices - mesh_src.bounds[0,m_edge]) / (mesh_src.bounds[1, m_edge] - mesh_src.bounds[0, m_edge])
+                    else:
+                        mmin, mmax = mesh_src.bounds
+                        mesh_src.vertices[:,0] = (mesh_src.vertices[:,0] - mmin[0]) / (mmax[0] - mmin[0])
+                        mesh_src.vertices[:,1] = (mesh_src.vertices[:,1] - mmin[1]) / (mmax[1] - mmin[1])
+                        mesh_src.vertices[:,2] = (mesh_src.vertices[:,2] - mmin[2]) / (mmax[2] - mmin[2])
+                mesh_src.apply_translation(-mesh_src.bounds.sum(axis=0)/2.)
+                mesh_src.apply_transform(trimesh.transformations.euler_matrix(0, np.pi, 0))
+
+                img_src = Image.fromarray(render_image_from_mesh(mesh_src.vertices, mesh_src.faces)).convert('RGB')
+                to_grid_f1_imgs.append(img_src)
+
+                arr_f1 = all_metrics['scores'][cat_id, model_id][f"F1@{_f1t:.6f}"]
+                _over_thresh = arr_f1 > _f1h
+                arr_f1 = arr_f1[_over_thresh]
+                sorted_arr_idx = np.argsort(arr_f1)
+                if len(arr_f1) < 10:
+                    _idx = sorted_arr_idx
+                else:
+                    _idx = sorted_arr_idx[-5:][::-1]
+                    _idx = np.concatenate((_idx, sorted_arr_idx[:5][::-1]))
+                close_10_dists = arr_f1[_idx]
+                log = f"> {i+1}: {close_10_dists.tolist()}\n"
+                with open(os.path.join(out_dir, f"scores_{_f1t}_{_f1h}.log"), 'a') as f:
+                    f.write(log)
+
+                for cat_id_val, model_id_val in val_ids[_over_thresh][_idx]:
+                    mesh_val = trimesh.load(os.path.join(shapenet_root_dir, cat_id_val, model_id_val, "models/model_normalized.obj"), force='mesh')
+                    if normalize:
+                        if norm_method == "iso_norm":
+                            m_edge = np.argmax(mesh_val.bounds[1] - mesh_val.bounds[0])
+                            mesh_val.vertices = (mesh_val.vertices - mesh_val.bounds[0,m_edge]) / (mesh_val.bounds[1, m_edge] - mesh_val.bounds[0, m_edge])
+                        else:
+                            mmin, mmax = mesh_val.bounds
+                            mesh_val.vertices[:,0] = (mesh_val.vertices[:,0] - mmin[0]) / (mmax[0] - mmin[0])
+                            mesh_val.vertices[:,1] = (mesh_val.vertices[:,1] - mmin[1]) / (mmax[1] - mmin[1])
+                            mesh_val.vertices[:,2] = (mesh_val.vertices[:,2] - mmin[2]) / (mmax[2] - mmin[2])
+                    mesh_val.apply_translation(-mesh_val.bounds.sum(axis=0)/2.)
+                    mesh_val.apply_transform(trimesh.transformations.euler_matrix(0, np.pi, 0))
+                    img_val = Image.fromarray(render_image_from_mesh(mesh_val.vertices, mesh_val.faces)).convert('RGB')
+                    to_grid_f1_imgs.append(img_val)
+                if len(arr_f1) < 10:
+                    for _ in range(10-len(arr_f1)):
+                        img_val = Image.fromarray(np.zeros((256,256,3), dtype='uint8')).convert('RGB')
+                        to_grid_f1_imgs.append(img_val)
+            grid = image_grid(to_grid_f1_imgs, rows=len(rnd_trains), cols=11)
+            grid.save(os.path.join(out_dir, f'img_grid_f1s_{_f1t}_{_f1h}.png'))
+            grid.close()
+            for img in to_grid_f1_imgs: img.close()
+
+def process_centered_full_annots():
+    shapenet_root_dir = '/mnt/noraid/karacam/ShapeNetCore.v2/'
+    with open("/mnt/noraid/karacam/Roca/Data/full_annotations.json", 'r') as f:
+        annots = json.load(f)
+    # def _tmp(annot):
+    for annot in tqdm(annots):
+        for m in annot['aligned_models']:
+            t = m['trs']['translation']
+            q = m['trs']['rotation']
+            s = m['trs']['scale']
+            mesh = trimesh.load(os.path.join(shapenet_root_dir, m['catid_cad'], m['id_cad'], "models/model_normalized.obj"), force='mesh')
+            C = -mesh.bounds.sum(axis=0)/2.
+            I = np.eye(4)
+            I[:3, 3] -= C
+            m['trs']['translation'], m['trs']['rotation'], m['trs']['scale'] = map(list, decompose_mat4(make_M_from_tqs(t,q,s) @ I))
+            mesh.apply_translation(C)
+            m['center'] = (mesh.bounds.sum(axis=0)/2.).tolist()
+        # return annot
+    # num_cores = int(0.4 * multiprocessing.cpu_count())
+    # new_annots = [Parallel(n_jobs=num_cores)(delayed(_tmp)(annot) for annot in tqdm(annots))]
+    with open("/mnt/noraid/karacam/Roca/Data/Dataset/CustomCenter/full_annotations_centered.json", 'w') as f:
+        json.dump(annots, f)
+
 # with torch.no_grad():
 #     ious = compare_ious()
+# with torch.no_grad():
+#     compare_f1()
+# compare_src_ious()
 # proccess_annotations()
 # process_400k_custom(split='val')
+# process_centered_full_annots()
 # joint_input_data(split='val')
 # make_mock_instances(split='val')
-process_top5_gt()
+# process_top5_gt()
+# get_all_emds()
+# get_all_emds(normalize=True)
+# get_all_emds(normalize=True, norm_method='iso_norm')
+# get_all_metrics(normalize=True)
+# get_logs_f1(normalize=True, norm_method='iso_norm')
+
+# with open("/home/karacam/Thesis/joint_learning_retrieval_deformation/shape2part_ext.json", 'r') as f:
+#     shape2part = json.load(f)
+# part2shape = dict([(value, key) for key, value in shape2part['chair']['model_names'].items()])
+# trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{part2shape['37698']}/models/model_normalized.obj", force='mesh').export('tst_tar.obj')
+# trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{part2shape['2267']}/models/model_normalized.obj", force='mesh').export('tst_src.obj')
+
+
+
+shapenet_root_dir = '/mnt/noraid/karacam/ShapeNetCore.v2/'
+# with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/points_train.pkl', 'rb') as f:
+#     points_train = pickle.load(f)
+# with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/points_val.pkl', 'rb') as f:
+#     points_val = pickle.load(f)
+
+# grids_train = {}
+# grids_val = {}
+
+# for pd in tqdm(points_train):
+#     mesh = trimesh.load(os.path.join(shapenet_root_dir, pd['catid_cad'], pd['id_cad'], "models/model_normalized.obj"), force='mesh')
+#     mesh.apply_translation(-mesh.bounds.sum(axis=0)/2.)
+#     samples = mesh.sample(10000)
+#     pc = samples[fps(torch.from_numpy(samples).to('cuda'), ratio=1024/10000).cpu().numpy()]
+#     pd['points'] = pc
+#     grid = voxelize_mesh(mesh)
+#     grids_train[pd['catid_cad'], pd['id_cad']] = grid
+
+# for pd in tqdm(points_val):
+#     mesh = trimesh.load(os.path.join(shapenet_root_dir, pd['catid_cad'], pd['id_cad'], "models/model_normalized.obj"), force='mesh')
+#     mesh.apply_translation(-mesh.bounds.sum(axis=0)/2.)
+#     samples = mesh.sample(10000)
+#     pc = samples[fps(torch.from_numpy(samples).to('cuda'), ratio=1024/10000).cpu().numpy()]
+#     pd['points'] = pc
+#     grid = voxelize_mesh(mesh)
+#     grids_val[pd['catid_cad'], pd['id_cad']] = grid
+
+# with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/points_train_center.pkl', 'wb') as f:
+#     pickle.dump(points_train, f)
+# with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/points_val_center.pkl', 'wb') as f:
+#     pickle.dump(points_val, f)
+# with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/train_grids_32_center.pkl', 'wb') as f:
+#     pickle.dump(grids_train, f)
+# with open('/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/val_grids_32_center.pkl', 'wb') as f:
+#     pickle.dump(grids_val, f)
+
+# target_data_fol = os.path.join("/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/data", "roca_targets_partial", "chair", "h5")
+# tid = random.choice(os.listdir(target_data_fol))
+# with h5py.File(os.path.join(target_data_fol, tid), 'r') as f:
+#     pc = f['points'][:]
+# trimesh.PointCloud(pc).export('tst_pc.ply')
+
+"""
+Transformation equivalence of annotations and instances
+"""
+# with open("/mnt/noraid/karacam/Roca/Data/full_annotations.json", 'r') as f:
+#     annots = json.load(f)
+# with open("/mnt/noraid/karacam/Roca/Data/Dataset/scan2cad_instances_val.json", 'r') as f:
+#     instances = json.load(f)
+# _i = np.random.randint(len(instances['annotations']))
+# inst = instances['annotations'][_i]
+# annot = None
+# for _a in annots:
+#     if _a['id_scan'] == inst['model']['scene_id']:
+#         annot = _a
+#         break
+# pose_id = instances['images'][inst['image_id']]['file_name'].split('/')[-1].split('.')[0]
+
+# with open(f"/mnt/noraid/karacam/Roca/Data/Images/tasks/scannet_frames_25k/{inst['model']['scene_id']}/pose/{pose_id}.txt", 'r') as f:
+#     cam2s = f.readlines()
+#     cam2s = np.asarray([np.array(t.split(), np.float32) for t in cam2s])
+
+# m = next(m for m in annot['aligned_models'] if m['id_cad'] == inst['model']['id_cad'])
+# c2w = make_M_from_tqs(m['trs']['translation'], m['trs']['rotation'], m['trs']['scale'])
+# s2w = make_M_from_tqs(annot['trs']['translation'], annot['trs']['rotation'], annot['trs']['scale'])
+# print(decompose_mat4(np.linalg.inv(cam2s) @ np.linalg.inv(s2w) @ c2w))
+# print(decompose_mat4(make_M_from_tqs(inst['t'], inst['q'], inst['s'])))
+"""--------------------------------------------------------"""
+
+# with open("/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/scan2cad_instances_train.json", 'r') as f:
+#     instances = json.load(f)
+
+# for annot in tqdm(instances['annotations']):
+#     mesh = trimesh.load(os.path.join(shapenet_root_dir, annot['model']['catid_cad'], annot['model']['id_cad'], "models/model_normalized.obj"), force='mesh')
+#     t = annot['t']
+#     q = annot['q']
+#     s = annot['s']
+
+#     C = mesh.bounds.sum(axis=0)/2.
+#     I = np.eye(4)
+#     I[:3, 3] += C
+#     annot['t'], annot['q'], annot['s'] = decompose_mat4(make_M_from_tqs(t, q, s) @ I)
+#     annot['t'], annot['q'], annot['s'] = (annot['t'].tolist(), annot['q'].tolist(), annot['s'].tolist())
+
+# with open("/mnt/noraid/karacam/Roca/Data/Dataset/CustomCenter/scan2cad_instances_train.json", 'w') as f:
+#     json.dump(instances, f)
+
+# with open("/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/scan2cad_instances_val.json", 'r') as f:
+#     instances = json.load(f)
+
+# for annot in tqdm(instances['annotations']):
+#     mesh = trimesh.load(os.path.join(shapenet_root_dir, annot['model']['catid_cad'], annot['model']['id_cad'], "models/model_normalized.obj"), force='mesh')
+#     t = annot['t']
+#     q = annot['q']
+#     s = annot['s']
+
+#     C = mesh.bounds.sum(axis=0)/2.
+#     I = np.eye(4)
+#     I[:3, 3] += C
+#     annot['t'], annot['q'], annot['s'] = decompose_mat4(make_M_from_tqs(t, q, s) @ I)
+#     annot['t'], annot['q'], annot['s'] = (annot['t'].tolist(), annot['q'].tolist(), annot['s'].tolist())
+
+# with open("/mnt/noraid/karacam/Roca/Data/Dataset/CustomCenter/scan2cad_instances_val.json", 'w') as f:
+#     json.dump(instances, f)
+
+JOINT_MODEL_PATH="/mnt/noraid/karacam/ThesisData/joint_learning_retrieval_deformation/log/chair522_1024p_v1_icp/model.pth"
+_model = torch.load(JOINT_MODEL_PATH)
+SOURCE_LATENT_CODES = _model["source_latent_codes"].detach()
+print(SOURCE_LATENT_CODES)
+print(SOURCE_LATENT_CODES.min())
