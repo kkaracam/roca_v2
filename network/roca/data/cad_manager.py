@@ -36,8 +36,8 @@ class CADManager:
             for model in models:
                 key = (model['catid_cad'], model['id_cad'])
                 mesh = Meshes(
-                    [torch.from_numpy(model['verts'])],
-                    [torch.from_numpy(model['faces'])]
+                    [torch.from_numpy(model['verts']).type(torch.float32)],
+                    [torch.from_numpy(model['faces']).type(torch.float32)]
                 )
                 self._data[model['category_id']][key] = mesh
                 self._syms[model['category_id']][key] = model['sym']

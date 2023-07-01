@@ -22,6 +22,7 @@ from roca.evaluation import (
     Vid2CADEvaluator,
 )
 from roca.utils.logging import CustomLogger
+from copy import deepcopy
 
 
 class Trainer(DefaultTrainer):
@@ -171,7 +172,7 @@ class Trainer(DefaultTrainer):
             key_prefix='retrieval_',
             src_info=v2c_eval.source_info
         )
-        ap_eval = InstanceEvaluator(dataset_name, cfg)
+        ap_eval = InstanceEvaluator(dataset_name, cfg, src_info=v2c_eval.source_info)
         depth_eval = DepthEvaluator(dataset_name, cfg)
         return DatasetEvaluators([ap_eval, depth_eval, v2c_eval, v2c_eval_ret])
 

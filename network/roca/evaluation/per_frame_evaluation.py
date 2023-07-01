@@ -9,6 +9,7 @@ import numpy as np
 import pycocotools.mask as mask_util
 import torch
 from tabulate import tabulate
+import pickle as pkl
 
 from detectron2.data import MetadataCatalog
 from detectron2.evaluation import DatasetEvaluator
@@ -18,12 +19,30 @@ from roca.data import CADCatalog, CategoryCatalog
 from roca.modeling.loss_functions import masked_l1_loss
 from roca.structures import Depths
 from roca.utils.ap import compute_ap, compare_meshes
+from roca.utils.alignment_errors import (
+    rotation_diff,
+    scale_ratio,
+    translation_diff,
+)
 from pytorch3d.structures.meshes import Meshes
+from pytorch3d.transforms import Transform3d
+
+from roca.modeling.retrieval_head.joint_retrieve_deform_ops import get_model, get_source_info_mesh, get_shape_numpy
+from roca.utils.linalg import make_M_from_tqs, decompose_mat4, transform_mesh
+import trimesh
+
+TRANS_THRESH = 0.3
+ROT_THRESH = 20
+SCALE_THRESH = 0.2
+
+NMS_TRANS = 0.4
+NMS_ROT = 60
+NMS_SCALE = 0.6
 
 class InstanceEvaluator(DatasetEvaluator):
-    def __init__(self, dataset_name: str, cfg, thresh=0.5):
+    def __init__(self, dataset_name: str, cfg, thresh=0.5, src_info=None):
         super().__init__()
-        self.ap_fields = ('box', 'mask')
+        self.ap_fields = ('box', 'mask', 'mesh')
         self.output_dir = cfg.OUTPUT_DIR
         self._metadata = MetadataCatalog.get(dataset_name)
         self._category_manager = CategoryCatalog.get(dataset_name)
@@ -31,9 +50,33 @@ class InstanceEvaluator(DatasetEvaluator):
         self._train_cad_manager = CADCatalog.get(cfg.DATASETS.TRAIN[0])
         self.pred_file = os.path.join(self.output_dir, 'per_frame_preds.json')
         self.thresh = thresh
+        self.DEFORM = True
+        self.joint = cfg.MODEL.RETRIEVAL_MODE == 'joint'
+        self.wild = cfg.MODEL.WILD_RETRIEVAL_ON
 
-        if cfg.MODEL.WILD_RETRIEVAL_ON:
-            self.ap_fields = (*self.ap_fields, 'mesh')
+        # if cfg.MODEL.WILD_RETRIEVAL_ON:
+        #     self.ap_fields = (*self.ap_fields, 'mesh')
+        with open("/mnt/noraid/karacam/ThesisData/data/roca_storagefurniture.json", 'r') as f:
+            storagefurniture_ids = json.load(f)
+            self.storagefurniture_ids = {e[1]:e[0] for e in storagefurniture_ids}
+
+        if self.DEFORM:
+            assert src_info
+            self.source_info = src_info
+            # filename_pickle = cfg.JOINT_SRC_PKL
+            # with open(filename_pickle, 'rb') as handle:
+            #     sources = pkl.load(handle)['sources']
+            # self.src_data_fol = cfg.JOINT_SRC_DIR
+            # with open("/home/karacam/Thesis/joint_learning_retrieval_deformation/shape2part_ext.json", 'r') as f:
+            #     self.shape2part = json.load(f)
+            # part2shape = dict([(value, key) for key, value in self.shape2part['chair']['model_names'].items()])
+            # self.source_info = {}
+            # print("Loading source mesh info...")
+            # for src in sources:
+            #     src_filename = str(src) + "_leaves.h5"
+            #     shapeid = part2shape[str(src)]
+            #     self.source_info[shapeid] = (get_model(os.path.join(self.src_data_fol, src_filename), pred=True))
+            print("Done.")
 
     def reset(self):
         self.preds = {}
@@ -55,7 +98,7 @@ class InstanceEvaluator(DatasetEvaluator):
     def evaluate(
         self,
         from_file: str = '',
-        print_every: int = 500
+        print_every: int = 100
     ) -> OrderedDictType[str, Dict[str, float]]:
 
         # Load predictions
@@ -66,6 +109,24 @@ class InstanceEvaluator(DatasetEvaluator):
             self._save_preds()
             all_preds = self.preds
 
+        all_scores = []
+        for p in all_preds:
+            all_scores.extend([o['score'] for o in all_preds[p]])
+        all_scores = np.array(all_scores)
+        # Get minimum, maximum, mean, median, and quantiles
+        min_score = np.min(all_scores)
+        max_score = np.max(all_scores)
+        mean_score = np.mean(all_scores)
+        median_score = np.median(all_scores)
+        q1_score = np.quantile(all_scores, 0.25)
+        q3_score = np.quantile(all_scores, 0.75)
+        print(f"Min score: {min_score}")
+        print(f"Max score: {max_score}")
+        print(f"Mean score: {mean_score}")
+        print(f"Median score: {median_score}")
+        print(f"Q1 score: {q1_score}")
+        print(f"Q3 score: {q3_score}")
+        # exit()
         # Collect results
         per_class_ap_data = self._eval_loop(all_preds, print_every)
 
@@ -90,7 +151,8 @@ class InstanceEvaluator(DatasetEvaluator):
                 ap_dict[cat] = compute_ap(
                     torch.as_tensor(ap_data['scores']),
                     torch.as_tensor(ap_data['labels']),
-                    ap_data['npos']
+                    ap_data['npos'],
+                    # verbose=True
                 )#.item()
                 # print(type(ap_dict[cat]))
                 # print(ap_dict[cat])
@@ -140,6 +202,8 @@ class InstanceEvaluator(DatasetEvaluator):
         objects = []
         for i in range(len(instances)):
             # Register trivial predictions
+            # if instances.scores[i].item() < 0.85:
+            #     continue
             datum = {
                 'score': instances.scores[i].item(),
                 'bbox': instances.pred_boxes.tensor[i].tolist(),
@@ -172,6 +236,10 @@ class InstanceEvaluator(DatasetEvaluator):
                 index = instances.pred_indices[i].item()
                 cad_id = output['cad_ids'][index]
                 datum['scene_cad_id'] = cad_id
+            
+            if 'pred_params' in output:
+                index = instances.pred_indices[i].item()
+                datum['pred_params'] = output['pred_params'][index].tolist()
 
             # Add predictions
             objects.append(datum)
@@ -213,6 +281,7 @@ class InstanceEvaluator(DatasetEvaluator):
         }
         file_to_id, id_to_annots = self._parse_data_json()
 
+        frame_aps = {}
         self.print('\nStarting per-frame evaluation')
         for n, file_name in enumerate(all_preds.keys()):
             if print_every > 0 and n % print_every == 0:
@@ -269,17 +338,15 @@ class InstanceEvaluator(DatasetEvaluator):
 
             fields = ['box', 'mask']
             field_ious = [box_ious, mask_ious]
-            # fields = ['box']
-            # field_ious = [box_ious]
 
-            # pvs = [e.vertices for e in self._train_cad_manager.models_by_ids([p['wild_cad_id'] for p in preds])]
-            # pfs = [e.faces for e in self._train_cad_manager.models_by_ids([p['wild_cad_id'] for p in preds])]
-            # gtvs = [e.vertices for e in self._train_cad_manager.models_by_ids([p['scene_cad_id'] for p in preds])]
-            # gtfs = [e.faces for e in self._train_cad_manager.models_by_ids([p['scene_cad_id'] for p in preds])]
-            # pred_meshes = Meshes(pvs, pfs)
-            # gt_meshes = Meshes(gtvs, gtfs)
-            # pred_meshes = [p['wild_cad_id'] for p in preds]
-            # gt_meshes = [p['scene_cad_id'] for p in preds]
+            # pose_file = file_name\
+            #     .replace('color', 'pose')\
+            #     .replace('.jpg', '.txt')
+            # with open(os.path.join(self._metadata.image_root, "tasks/scannet_frames_25k/", pose_file)) as f:
+            #     pose_mat = np.array([
+            #         [float(v) for v in line.strip().split()]
+            #         for line in f
+            #     ])
 
             # Collect AP labels and scores
             for field, ious in zip(fields, field_ious):
@@ -299,6 +366,111 @@ class InstanceEvaluator(DatasetEvaluator):
                     ap_data = per_class_ap_data[field][category]
                     ap_data['scores'].append(preds[i]['score'])
                     ap_data['labels'].append(float(matched))
+
+            covered = [False for _ in annots]
+            _aps = {'scores':[], 'labels':[]}
+            for i in range(len(preds)):
+                matched = False
+                if self.DEFORM:
+                    pred_params = preds[i]['pred_params']
+                    default_param, vertices_mat, faces, constraint_proj_mat = self.source_info[preds[i]['scene_cad_id'][1]]
+                    curr_param = np.array(pred_params, copy=True)
+                    curr_param = np.expand_dims(curr_param, -1)
+                    curr_mat, curr_default_param, curr_conn_mat = get_source_info_mesh(vertices_mat, default_param, constraint_proj_mat, curr_param.shape[0])
+                    output_vertices = get_shape_numpy(curr_mat, curr_param, curr_default_param.T, connectivity_mat=curr_conn_mat)
+                    pred_mesh = Meshes([torch.from_numpy(output_vertices).type(torch.float)], [torch.from_numpy(faces).type(torch.float)])
+                elif self.joint:
+                    pred_mesh = self._train_cad_manager.model_by_id(*preds[i]['scene_cad_id'])
+                elif self.wild:
+                    pred_mesh = self._train_cad_manager.model_by_id(*preds[i]['wild_cad_id'])
+                else:
+                    pred_mesh = self._val_cad_manager.model_by_id(*preds[i]['scene_cad_id'])
+
+                pred_trans = torch.as_tensor(preds[i]['t'])
+                pred_rot = np.quaternion(*preds[i]['q'])
+                pred_scale = torch.as_tensor(preds[i]['s'])
+                pred_mesh_transformed = transform_mesh(pred_mesh, pred_trans, pred_rot, pred_scale)
+
+                # pose_mat = pose_mat.reshape(4, 4)
+                # mat = make_M_from_tqs(pred_trans.tolist(), pred_rot.tolist(), pred_scale.tolist())
+                # pred_trans, pred_rot, pred_scale = decompose_mat4(pose_mat @ mat)
+                # pred_trans, pred_scale = torch.as_tensor(pred_trans), torch.as_tensor(pred_scale)
+                # pred_rot = np.quaternion(*pred_rot)
+                # if self.joint and self.DEFORM:
+                #     pred_mesh = Meshes([torch.from_numpy(trimesh.transform_points(output_vertices, mat)).type(torch.float)], [torch.from_numpy(faces).type(torch.float)])
+                # else:
+                #     pred_T = Transform3d(matrix=torch.as_tensor(mat, dtype=torch.float).unsqueeze(0))
+                #     pred_mesh = Meshes([pred_T.transform_points(pred_mesh.verts_list()[0])], pred_mesh.faces_list())
+
+                for j in range(len(annots)):
+                    if covered[j]:
+                        continue
+                    category = preds[i]['category']
+                    if category != annots[j]['category']:
+                        continue
+
+                    # if box_ious[i, j] < self.thresh:
+                    #     continue
+                    gt_trans = torch.tensor(annots[j]['t'])
+                    gt_rot = np.quaternion(*annots[j]['q'])
+                    gt_scale = torch.tensor(annots[j]['s'])
+
+                    # mat_gt = make_M_from_tqs(gt_trans.tolist(), gt_rot.tolist(), gt_scale.tolist())
+                    # gt_trans, gt_rot, gt_scale = decompose_mat4(pose_mat @ mat)
+                    # gt_trans, gt_scale = torch.as_tensor(gt_trans), torch.as_tensor(gt_scale)
+                    # gt_rot = np.quaternion(*gt_rot)
+
+                    # angle_diff = rotation_diff(pred_rot, gt_rot)
+                    # is_correct = (
+                    #     translation_diff(pred_trans, gt_trans) <= TRANS_THRESH
+                    #     and angle_diff <= ROT_THRESH
+                    #     and scale_ratio(pred_scale, gt_scale) <= SCALE_THRESH
+                    # )
+                    # is_correct = (
+                    #     translation_diff(pred_trans, gt_trans) <= NMS_TRANS
+                    #     and angle_diff <= NMS_ROT
+                    #     and scale_ratio(pred_scale, gt_scale) <= NMS_SCALE
+                    # )
+
+                    # Alignment-aware AP
+                    # if not is_correct:
+                    #     continue
+
+                    if annots[j]['model']['id_cad'] in self.storagefurniture_ids:
+                        gt_mesh = self._val_cad_manager.model_by_id(self.storagefurniture_ids[annots[j]['model']['id_cad']], annots[j]['model']['id_cad'])
+                    else:
+                        gt_mesh = self._val_cad_manager.model_by_id(annots[j]['model']['catid_cad'], annots[j]['model']['id_cad'])
+                    # gt_T = Transform3d(matrix=torch.as_tensor(mat_gt, dtype=torch.float).unsqueeze(0))
+                    # gt_mesh = Meshes([gt_T.transform_points(gt_mesh.verts_list()[0])], gt_mesh.faces_list())
+                    # gt_mesh = Meshes([torch.from_numpy(trimesh.transform_points(gt_mesh_tmp.verts_list()[0].numpy(), mat_gt)).type(torch.float)], gt_mesh_tmp.faces_list())
+
+                    # metrics = compare_meshes(pred_mesh.to('cuda'), gt_mesh.to('cuda'), thresholds=[0.3])
+                    metrics = compare_meshes(
+                        pred_mesh_transformed.to('cuda'), 
+                        transform_mesh(gt_mesh, gt_trans, gt_rot, gt_scale).to('cuda'), 
+                        thresholds=[0.3],
+                        scale='gt-1'
+                        # scale=1.
+                    )
+
+                    f1_score = metrics['F1@0.300000']
+                    if f1_score >= 99.:
+                        covered[j] = True
+                        matched = True
+                        break
+                ap_data = per_class_ap_data['mesh'][category]
+                ap_data['scores'].append(preds[i]['score'])
+                ap_data['labels'].append(float(matched))
+                _aps['scores'].append(preds[i]['score'])
+                _aps['labels'].append(float(matched))
+
+            frame_aps[file_name] = float(compute_ap(
+                torch.as_tensor(_aps['scores']), 
+                torch.as_tensor(_aps['labels']),
+                len(annots)
+            ))
+        # with open(os.path.join(self.output_dir, 'frame_aps.json'), 'w') as f:
+        #     json.dump(frame_aps, f)
 
         return per_class_ap_data
 

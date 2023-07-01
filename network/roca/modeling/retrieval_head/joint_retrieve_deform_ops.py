@@ -198,3 +198,39 @@ def get_symmetric(pc):
 	reflected_pc = torch.cat([-pc[:,:,0].unsqueeze(-1), pc[:,:,1].unsqueeze(-1), pc[:,:,2].unsqueeze(-1)], axis=2)
 
 	return reflected_pc
+
+def get_source_info_mesh(points_mat, default_param, constraint_proj_mat, max_num_params, use_connectivity=True):
+    padded_mat = np.zeros((points_mat.shape[0], max_num_params))
+    padded_mat[0:points_mat.shape[0], 0:points_mat.shape[1]] = points_mat
+    # padded_mat = np.expand_dims(padded_mat, axis=0)
+
+    padded_default_param = np.zeros(max_num_params)
+    padded_default_param[:default_param.shape[0]] = default_param
+    padded_default_param = np.expand_dims(padded_default_param, axis=0)
+
+    constraint_padded_mat = np.zeros((max_num_params, max_num_params))
+    constraint_padded_mat[0:constraint_proj_mat.shape[0], 0:constraint_proj_mat.shape[1]] = constraint_proj_mat	
+
+    return padded_mat.astype("float"), padded_default_param.astype("float"), constraint_padded_mat.astype("float")
+
+def get_shape_numpy(A, param, src_default_param=None, weight=0.1, connectivity_mat = None):
+    ### A is the parametric model of the shape
+    ### assumes that the shape of A and param agree
+    param = np.multiply(param, weight)
+
+    if (src_default_param is None):
+        param = param
+    else:
+        param = param + src_default_param
+
+    # For connectivity
+    if connectivity_mat is None:
+        param = param
+
+    else:
+        # print("Using connectivity constraint for mesh generation.")
+        param = np.matmul(connectivity_mat, param)
+
+    pc = np.reshape(np.matmul(A, param), (-1, 3), order='C')
+
+    return pc

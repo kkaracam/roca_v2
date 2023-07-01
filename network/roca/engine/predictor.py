@@ -17,7 +17,7 @@ from roca.data.datasets import register_scan2cad
 from roca.structures import Intrinsics
 from roca.utils.alignment_errors import translation_diff
 from roca.utils.linalg import make_M_from_tqs
-from roca.modeling.retrieval_head.joint_retrieve_deform_ops import get_model
+from roca.modeling.retrieval_head.joint_retrieve_deform_ops import get_model, get_source_info_mesh, get_shape_numpy
 
 try:
     import sys
@@ -53,7 +53,9 @@ class Predictor:
         register_scan2cad(data_name, {}, '', data_dir, '', '', 'val')
 
         cad_manager = CADCatalog.get(data_name)
-        points, ids = cad_manager.batched_points_and_ids(volumes=False)
+        self.is_voxel = cfg.INPUT.CAD_TYPE == 'voxel'
+        self.joint = cfg.MODEL.RETRIEVAL_MODE == 'joint'
+        points, ids = cad_manager.batched_points_and_ids(volumes=self.is_voxel)
         model.set_cad_models(points, ids, cad_manager.scene_alignments)
         model.embed_cad_models()
 
@@ -61,13 +63,16 @@ class Predictor:
         if wild:
             data_name = data_name.replace('Val', 'Train')
             register_scan2cad(data_name, {}, '', data_dir, '', '', 'train')
-            cad_manager = CADCatalog.get(data_name)
-            train_points, train_ids = cad_manager.batched_points_and_ids(
-                volumes=False
+            self.train_cad_manager = CADCatalog.get(data_name)
+            train_points, train_ids = self.train_cad_manager.batched_points_and_ids(
+                volumes=self.is_voxel
             )
             model.set_train_cads(train_points, train_ids)
             model.embed_train_cads()
-
+        else:
+            data_name = data_name.replace('Val', 'Train')
+            register_scan2cad(data_name, {}, '', data_dir, '', '', 'train')
+            self.train_cad_manager = CADCatalog.get(data_name)
         self.model = model
         self.cad_manager = cad_manager
 
@@ -84,56 +89,32 @@ class Predictor:
             [0, 0, 0, 1]
         ])
 
-        filename_pickle = cfg.JOINT_BASE_DIR+"data/generated_datasplits/chair_519_roca.pickle"
-        with open(filename_pickle, 'rb') as handle:
-            self.sources = pickle.load(handle)['sources']
-        self.src_data_fol = cfg.JOINT_SRC_DIR
-        with open("/home/karacam/Thesis/joint_learning_retrieval_deformation/shape2part_ext.json", 'r') as f:
-            self.shape2part = json.load(f)
-        # print("Loading sources...")
-        # ##Get the data of the sources
-        # ## Get max number of params for the embedding size
-        # MAX_NUM_PARAMS = -1
-        # MAX_NUM_PARTS = -1
-        # SOURCE_MODEL_INFO = []
-
-        # for i in range(len(sources)):
-        # # for i in range(15):
-        #     source_model = sources[i]
-        #     src_filename = str(source_model) + "_leaves.h5"
-
-        #     default_param, vertices_mat, faces, constraint_proj_mat	= get_model(os.path.join(src_data_fol, src_filename), pred=True)
-
-        #     curr_source_dict = {}
-        #     curr_source_dict["default_param"] = default_param
-        #     # curr_source_dict["points"] = points
-        #     # curr_source_dict["point_labels"] = point_labels
-        #     # curr_source_dict["points_mat"] = points_mat
-        #     # curr_source_dict["vertices"] = vertices
-        #     curr_source_dict["vertices_mat"] = vertices_mat
-        #     curr_source_dict["faces"] = faces
-        #     # curr_source_dict["face_labels"] = face_labels
-        #     # curr_source_dict["model_id"] = source_model
-
-        #     # curr_source_dict["constraint_mat"] = constraint_mat
-        #     curr_source_dict["constraint_proj_mat"] = constraint_proj_mat
-
-        #     # Get number of parts of the model
-        #     # num_parts = len(np.unique(point_labels))
-        #     # curr_source_dict["num_parts"] = num_parts
-
-        #     curr_num_params = default_param.shape[0]
-        #     if (MAX_NUM_PARAMS < curr_num_params):
-        #         MAX_NUM_PARAMS = curr_num_params
-        #         MAX_NUM_PARTS = int(MAX_NUM_PARAMS/6)
-        #     SOURCE_MODEL_INFO.append(curr_source_dict)
-
-        # self.MAX_NUM_PARAMS = MAX_NUM_PARAMS
-        # self.MAX_NUM_PARTS = MAX_NUM_PARTS
-        # self.SOURCE_MODEL_INFO = SOURCE_MODEL_INFO
-        # print("Done loading sources.")
-        # print(len(SOURCE_MODEL_INFO))
-        print('\nDone building predictor\n')
+        if self.joint:
+            with open("/home/karacam/Thesis/ROCA/shape2part_ext.json", 'r') as f:
+                shape2part = json.load(f)
+            part2shape = dict([(value, key) for k in shape2part for key, value in shape2part[k]['model_names'].items()])
+            self.source_info = {}
+            for c_name, _num_s in zip(['chair','table','storagefurniture','display','bin'], [522,676,306,138,79]):
+                filename_pickle = cfg.JOINT_SRC_PKL.format(c_name, _num_s)
+                with open(filename_pickle, 'rb') as handle:
+                    sources = pickle.load(handle)['sources']
+                self.src_data_fol = cfg.JOINT_SRC_DIR.format(c_name)
+                print("Loading source mesh info...")
+                for src in sources:
+                    src_filename = str(src) + "_leaves.h5"
+                    shapeid = part2shape[str(src)]
+                    self.source_info[shapeid] = (get_model(os.path.join(self.src_data_fol, src_filename), pred=True))
+            print("Done.")
+                # filename_pickle = cfg.JOINT_SRC_PKL
+                # with open(filename_pickle, 'rb') as handle:
+                #     sources = pickle.load(handle)['sources']
+                # self.src_data_fol = cfg.JOINT_SRC_DIR
+                # print("Loading source mesh info...")
+                # for src in sources:
+                #     src_filename = str(src) + "_leaves.h5"
+                #     shapeid = part2shape[str(src)]
+                #     self.source_info[shapeid] = (get_model(os.path.join(self.src_data_fol, src_filename), pred=True))
+                # print("Done.")
 
     @property
     def can_render(self):
@@ -163,7 +144,8 @@ class Predictor:
         if len(outputs["instances"]) == 0:
             return outputs['instances'].to('cpu'), []
         cad_ids = outputs['wild_cad_ids'] if self.wild else outputs['cad_ids']
-        return outputs['instances'].to('cpu'), cad_ids, outputs['pred_params'].cpu().numpy(), outputs['joint_idx'].cpu().numpy()
+        params = outputs['pred_params'] if ('pred_params' in outputs) and self.joint else None
+        return outputs['instances'].to('cpu'), cad_ids, params#.to('cpu')
 
     def output_to_mesh(
         self,
@@ -174,11 +156,29 @@ class Predictor:
         nms_3d: bool = True,
         as_open3d: bool = False,
         params=None,
-        joint_idx=None,
+        fname=None
     ) -> Union[List[trimesh.Trimesh], List[Any]]:
 
         meshes = []
         trans_cls_scores = []
+        if fname is not None:
+            for i in range(len(instances)):
+                cad_id = cad_ids[i]
+                if cad_id is None:
+                    continue
+                ret_mesh = self.train_cad_manager.model_by_id(*cad_id)
+                pred_params = params[i].cpu().numpy()
+                default_param, vertices_mat, faces, constraint_proj_mat = self.source_info[cad_id[1]]
+                curr_param = np.expand_dims(pred_params, -1)
+                curr_mat, curr_default_param, curr_conn_mat = get_source_info_mesh(vertices_mat, default_param, constraint_proj_mat, curr_param.shape[0])
+                output_vertices = get_shape_numpy(curr_mat, curr_param, curr_default_param.T, connectivity_mat=curr_conn_mat)
+                def_mesh = trimesh.Trimesh(
+                    vertices=output_vertices,
+                    faces=faces
+                )
+                meshes.append(ret_mesh)
+                meshes.append(def_mesh)
+            return meshes
         for i in range(len(instances)):
             cad_id = cad_ids[i]
             if cad_id is None:
@@ -193,11 +193,9 @@ class Predictor:
             ))
 
             if params is not None:
-                source_model = self.sources[i]
-                src_filename = str(source_model) + "_leaves.h5"
-
-                default_param, vertices_mat, faces, constraint_proj_mat	= get_model(os.path.join(self.src_data_fol, src_filename), pred=True)
-                curr_param = np.expand_dims(params[i], -1)
+                pred_params = params[i].cpu().numpy()
+                default_param, vertices_mat, faces, constraint_proj_mat = self.source_info[cad_id[1]]
+                curr_param = np.expand_dims(pred_params, -1)
                 curr_mat, curr_default_param, curr_conn_mat = get_source_info_mesh(vertices_mat, default_param, constraint_proj_mat, curr_param.shape[0])
                 output_vertices = get_shape_numpy(curr_mat, curr_param, curr_default_param.T, connectivity_mat=curr_conn_mat)
                 mesh = trimesh.Trimesh(
@@ -205,7 +203,10 @@ class Predictor:
                     faces=faces
                 )
             else:
-                mesh = self.cad_manager.model_by_id(*cad_ids[i])
+                if self.wild or self.joint:
+                    mesh = self.train_cad_manager.model_by_id(*cad_id)
+                else:
+                    mesh = self.cad_manager.model_by_id(*cad_id)
                 mesh = trimesh.Trimesh(
                     vertices=mesh.verts_list()[0].numpy(),
                     faces=mesh.faces_list()[0].numpy()
@@ -281,6 +282,22 @@ class Predictor:
         raster.set_colors(colors)
         raster.render_colors(0.2)
         return raster.read_color(), raster.read_idx()
+    
+    def annot_meshes(self, annot):
+        mesh = self.cad_manager.model_by_id(annot['model']['catid_cad'], annot['model']['id_cad'])
+        mesh = trimesh.Trimesh(
+            vertices=mesh.verts_list()[0].numpy(),
+            faces=mesh.faces_list()[0].numpy()
+        )
+        trs = make_M_from_tqs(
+            annot['t'],
+            annot['q'],
+            annot['s']
+        )
+        mesh.apply_transform(self.scene_rot @ trs)
+        color = COLOR_BY_CLASS[int(annot['model']['catid_cad'])]
+        mesh.visual.face_colors = [*(255 * color), 255]
+        return mesh
 
     @staticmethod
     def _3d_nms(tcs, min_dist):
@@ -295,39 +312,3 @@ class Predictor:
                 keeps[i] = False
         return keeps
 
-def get_source_info_mesh(points_mat, default_param, constraint_proj_mat, max_num_params, use_connectivity=True):
-
-    padded_mat = np.zeros((points_mat.shape[0], max_num_params))
-    padded_mat[0:points_mat.shape[0], 0:points_mat.shape[1]] = points_mat
-    # padded_mat = np.expand_dims(padded_mat, axis=0)
-
-    padded_default_param = np.zeros(max_num_params)
-    padded_default_param[:default_param.shape[0]] = default_param
-    padded_default_param = np.expand_dims(padded_default_param, axis=0)
-
-    constraint_padded_mat = np.zeros((max_num_params, max_num_params))
-    constraint_padded_mat[0:constraint_proj_mat.shape[0], 0:constraint_proj_mat.shape[1]] = constraint_proj_mat	
-
-    return padded_mat.astype("float"), padded_default_param.astype("float"), constraint_padded_mat.astype("float")
-
-def get_shape_numpy(A, param, src_default_param=None, weight=0.1, connectivity_mat = None):
-    ### A is the parametric model of the shape
-    ### assumes that the shape of A and param agree
-    param = np.multiply(param, weight)
-
-    if (src_default_param is None):
-        param = param
-    else:
-        param = param + src_default_param
-
-    # For connectivity
-    if connectivity_mat is None:
-        param = param
-
-    else:
-        # print("Using connectivity constraint for mesh generation.")
-        param = np.matmul(connectivity_mat, param)
-
-    pc = np.reshape(np.matmul(A, param), (-1, 3), order='C')
-
-    return pc	

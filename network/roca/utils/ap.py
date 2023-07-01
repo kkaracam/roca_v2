@@ -2,7 +2,7 @@
 import torch
 
 
-def compute_ap(scores, labels, npos, device=None):
+def compute_ap(scores, labels, npos, device=None, verbose=False):
     if device is None:
         device = scores.device
 
@@ -23,6 +23,9 @@ def compute_ap(scores, labels, npos, device=None):
     rec = tp / npos   # tp + fp
     # import pdb; pdb.set_trace()
     prec = tp / (fp + tp)
+    if verbose:
+        print('Max,Min,Mean Recall: ', max(rec), min(rec), sum(rec)/len(rec))
+        print('Max,Min,Mean Precision: ', max(prec), min(prec), sum(prec)/len(prec))
     ap = xVOCap(rec, prec, device)
 
     # import pdb; pdb.set_trace()

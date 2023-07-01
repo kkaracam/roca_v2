@@ -245,7 +245,8 @@ class AlignmentHead(nn.Module):
             instances,
             mask_pred,
             nocs,
-            shape_code
+            shape_code,
+            gt_classes
         ))
 
         return losses
@@ -759,7 +760,7 @@ class AlignmentHead(nn.Module):
 
         return mask_probs
 
-    def _forward_retrieval_train(self, instances, mask, nocs, shape_code):
+    def _forward_retrieval_train(self, instances, mask, nocs, shape_code, gt_classes):
         losses = {}
         # pos_cads = L.cat([p.gt_pos_cads for p in instances])
         # neg_cads = L.cat([p.gt_neg_cads for p in instances])
@@ -776,21 +777,22 @@ class AlignmentHead(nn.Module):
         # print(losses)
         # exit()
 
-        # if not self.retrieval_head.baseline:
-        pos_cads = L.cat([p.gt_pos_cads for p in instances])
-        neg_cads = L.cat([p.gt_neg_cads for p in instances])
+        if not self.retrieval_head.baseline:
+            pos_cads = L.cat([p.gt_pos_cads for p in instances])
+            neg_cads = L.cat([p.gt_neg_cads for p in instances])
 
-        # TODO: make this configurable
-        sample = torch.randperm(pos_cads.size(0))[:32]
+            # TODO: make this configurable
+            sample = torch.randperm(pos_cads.size(0))[:32]
 
-        a = self.retrieval_head(
-            masks=mask[sample],
-            noc_points=nocs[sample],
-            shape_code=shape_code[sample],
-            pos_cads=pos_cads[sample],
-            neg_cads=neg_cads[sample]
-        )
-        losses.update(a)
+            a = self.retrieval_head(
+                masks=mask[sample],
+                noc_points=nocs[sample],
+                shape_code=shape_code[sample],
+                pos_cads=pos_cads[sample],
+                neg_cads=neg_cads[sample],
+                classes=gt_classes[sample]
+            )
+            losses.update(a)
         
         return losses
 
@@ -866,8 +868,8 @@ class AlignmentHead(nn.Module):
                 wild_retrieval=self.wild_retrieval,
                 shape_code=shape_code
             )
-            extra_outputs['cad_ids'] = wild_cad_ids
-            predictions['pred_indices'] = wild_pred_indices
+            # extra_outputs['cad_ids'] = wild_cad_ids
+            # predictions['pred_indices'] = wild_pred_indices
             # cad_ids, pred_indices, params, idx = self.retrieval_head(
             #     classes=pred_classes,
             #     masks=pred_masks,
@@ -876,9 +878,9 @@ class AlignmentHead(nn.Module):
             #     instance_sizes=instance_sizes,
             #     has_alignment=has_alignment
             # )
-            # extra_outputs['wild_cad_ids'] = cad_ids
+            extra_outputs['wild_cad_ids'] = wild_cad_ids
             # extra_outputs['pred_wild_params'] = params
             # extra_outputs['wild_joint_idx'] = idx
-            # predictions['pred_wild_indices'] = pred_indices
+            predictions['pred_wild_indices'] = wild_pred_indices
 
         return predictions, extra_outputs

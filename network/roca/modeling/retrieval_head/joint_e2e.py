@@ -47,13 +47,14 @@ class JointE2EHead(nn.Module):
         self.wild_points_by_class: Optional[TensorByClass] = None
         self.wild_ids_by_class: Optional[IDByClass] = None
 
+        self.num_classes = 5
+
         self.baseline = cfg.MODEL.RETRIEVAL_BASELINE
         if self.baseline:
             return
 
         if self.loss_type == 'regression':
             self.loss = nn.MSELoss()
-            self.loss_trip = nn.TripletMarginLoss(margin=margin)
         elif self.loss_type == 'triplet':
             self.loss = nn.TripletMarginLoss(margin=margin)
         else:
@@ -70,7 +71,9 @@ class JointE2EHead(nn.Module):
             assert not self.is_voxel, 'Inconsistent CAD modality'
             self.cad_net = PointNet()
         elif self.cad_mode == 'joint':
-            self.joint_net = JointNet(cfg)
+            self.joint_net = {}
+            for i, _num_s in zip([0,1,2,3,4], [522,676,306,138,79]):
+                self.joint_net[i] = JointNet(cfg, i, _num_s)
             self.cad_net_ret = PointNet()
             self.cad_net_tar = PointNet()
             # self.cad_net = JointNet(cfg)
@@ -86,52 +89,25 @@ class JointE2EHead(nn.Module):
             self.noc_net = PointNet()
         elif self.noc_mode in ('joint', "joint+e2e"):
             self.noc_net_ret = nn.ModuleDict({
-                'pointnet': PointNet(fc_out=True),
-                'image': self.make_image_mlp()
+                'pointnet': PointNet(fc_out=True, joint=True, num_classes=self.num_classes),
+                'image': self.make_image_mlp(embed_dim=256*self.num_classes)
             })
             self.noc_net_tar = nn.ModuleDict({
-                'pointnet': PointNet(fc_out=True),
-                'image': self.make_image_mlp()
+                'pointnet': PointNet(fc_out=True, joint=True, num_classes=self.num_classes),
+                'image': self.make_image_mlp(embed_dim=256*self.num_classes)
             })
-        elif self.noc_mode == 'joint+mlp':
-            resnet = ResNetEncoder()
-            self.noc_net_ret = nn.ModuleDict({
-                'pointnet': PointNet(),
-                'image': self.make_image_mlp(),
-                'map': nn.Sequential(
-                    # nn.Linear(1024, 1024),
-                    # nn.ReLU(),
-                    nn.Linear(1024, self.joint_net.embedding_dim)
-                )
-            })
-            self.noc_net_tar = nn.ModuleDict({
-                'pointnet': PointNet(),
-                'image': self.make_image_mlp(),
-                'map': nn.Sequential(
-                    # nn.Linear(1024, 1024),
-                    # nn.ReLU(),
-                    nn.Linear(1024, self.joint_net.embedding_dim)
-                )
-            })
-        elif self.noc_mode == 'joint+image':
-            resnet = ResNetEncoder()
-            self.noc_net_ret = nn.ModuleDict({
-                'image': self.make_image_mlp(),
-                'map': nn.Sequential(
-                    nn.Linear(1024, 1024),
-                    nn.ReLU(),
-                    nn.Linear(1024, self.joint_net.embedding_dim)
-                )
-            })
-            self.noc_net_tar = nn.ModuleDict({
-                'image': self.make_image_mlp(),
-                'map': nn.Sequential(
-                    nn.Linear(1024, 1024),
-                    nn.BatchNorm2d(1024),
-                    nn.ReLU(),
-                    nn.Linear(1024, self.joint_net.embedding_dim)
-                )
-            })
+        elif self.noc_mode == 'joint+sep':
+            self.noc_net_ret = nn.ModuleDict()
+            self.noc_net_tar = nn.ModuleDict()
+            for i in range(self.num_classes):
+                self.noc_net_ret.update({
+                    f'pointnet_{i}': PointNet(fc_out=True),
+                    f'image_{i}': self.make_image_mlp(embed_dim=256)
+                })
+                self.noc_net_tar.update({
+                    f'pointnet_{i}': PointNet(fc_out=True),
+                    f'image_{i}': self.make_image_mlp(embed_dim=256)
+                })
         elif self.noc_mode == 'image':
             self.noc_net = self.make_image_mlp()
         elif self.noc_mode == 'pointnet+image':
@@ -144,20 +120,20 @@ class JointE2EHead(nn.Module):
         elif self.noc_mode == 'resnet+image':
             self.noc_net = nn.ModuleDict({
                 'resnet': ResNetEncoder(),
-                'image': self.make_image_mlp()
+                'image': self.make_image_mlp(embed_dim=256)
             })
         elif self.noc_mode in ('resnet+image+comp', 'resnet+image+fullcomp'):
             resnet = ResNetEncoder()
             self.noc_net = nn.ModuleDict({
                 'resnet': resnet,
-                'image': self.make_image_mlp(),
+                'image': self.make_image_mlp(embed_dim=256),
                 'comp': ResNetDecoder(relu_in=True, feats=resnet.feats)
             })
             self.comp_loss = nn.BCELoss()
         else:
             raise ValueError('Unknown noc mode {}'.format(self.noc_mode))
 
-    def make_image_mlp(self, relu_out: bool = True, embed_dim=256) -> nn.Module:
+    def make_image_mlp(self, relu_out: bool = True, embed_dim=1024) -> nn.Module:
         # if self.noc_mode in ('joint', "joint+e2e"):
         #     embed_dim = self.joint_net.embedding_dim
         # elif self.cad_mode == 'joint':
@@ -239,42 +215,34 @@ class JointE2EHead(nn.Module):
             assert neg_cads is not None
 
             if self.cad_mode == 'joint':
-                if self.noc_mode == 'joint+image':
-                    ret_noc_embed = self.noc_net_ret['image'](shape_code)
-                    tar_noc_embed = self.noc_net_tar['image'](shape_code)
+                losses['loss_embedding_ret'] = 0
+                losses['loss_embedding_tar'] = 0
+                if self.noc_mode == 'joint+sep':
+                    for i in range(self.num_classes):
+                        class_mask = classes == i
+                        if not class_mask.any():
+                            continue
+                        ret_noc_embed = self.noc_net_ret[f'pointnet_{i}'](noc_points[class_mask], masks[class_mask]) + self.noc_net_ret[f'image_{i}'](shape_code[class_mask])
+                        tar_noc_embed = self.noc_net_tar[f'pointnet_{i}'](noc_points[class_mask].detach(), masks[class_mask].detach()) + self.noc_net_tar[f'image_{i}'](shape_code[class_mask].detach())
+                        ret_pos_embed, tar_pos_embed = self.joint_net[i]._embed(pos_cads[class_mask])
+                        losses['loss_embedding_ret'] += self.loss(
+                            ret_noc_embed,
+                            ret_pos_embed
+                        ) / class_mask.sum()
+                        losses['loss_embedding_tar'] += self.loss(
+                            tar_noc_embed, 
+                            tar_pos_embed
+                        )
                 else:
                     ret_noc_embed = self.noc_net_ret['pointnet'](noc_points, masks) + self.noc_net_ret['image'](shape_code)
                     tar_noc_embed = self.noc_net_tar['pointnet'](noc_points.detach(), masks.detach()) + self.noc_net_tar['image'](shape_code.detach())
-
-                if self.loss_type == 'regression':
-                    ret_pos_embed, tar_pos_embed = self.joint_net._embed(pos_cads)
-                    ret_noc_embed = self.noc_net_ret['map'](ret_noc_embed) if self.noc_mode == 'joint+image' else ret_noc_embed
-                    losses['loss_embedding_ret'] = self.loss(ret_noc_embed, ret_pos_embed)
-                    # losses['loss_embedding_tar'] = self.loss_trip(tar_noc_embed, tar_pos_embed[0], tar_neg_embed[0])
-                    # for i in range(tar_noc_embed.shape[0]):
-                    candidates = self.joint_net._retrieval(ret_noc_embed)
-                    fitting_loss = self.joint_net._deform(tar_noc_embed, candidates.flatten(), pos_cads)
-                    losses['loss_fitting'] = 10 * fitting_loss + self.loss(ret_noc_embed, ret_pos_embed)
-
-
-                elif self.loss_type == 'triplet': 
-                    ret_pos_embed, ret_neg_embed, tar_pos_embed, tar_neg_embed = self.joint_net._embed_trip(pos_cads, neg_cads)
-                    ret_noc_embed = self.noc_net_ret['map'](ret_noc_embed) if self.noc_mode == 'joint+image' else ret_noc_embed
-                    losses['loss_triplet'] = self.loss(ret_noc_embed, ret_pos_embed, ret_neg_embed)/2. + self.loss(tar_noc_embed, tar_pos_embed, tar_neg_embed)/2.
-                else:
-                    ret_pos_embed, ret_neg_embed, tar_pos_embed, tar_neg_embed = self.joint_net._embed_trip(pos_cads, neg_cads)
-                    ret_pos = self.cad_net_ret(pos_cads.transpose(-2,-1))
-                    ret_neg = self.cad_net_ret(neg_cads.transpose(-2,-1))
-                    # tar_pos = self.cad_net_tar(pos_cads.transpose(-2,-1))
-                    # tar_neg = self.cad_net_tar(neg_cads.transpose(-2,-1))
-
-                    losses['loss_triplet'] = self.loss_trip(ret_noc_embed, ret_pos, ret_neg)# + self.loss_trip(tar_noc_embed, tar_pos, tar_neg)
-                    ret_pos = self.noc_net_ret['map'](ret_pos)
-                    # tar_pos = self.noc_net_tar['map'](tar_pos)
-                    ret_noc_embed = self.noc_net_ret['map'](ret_noc_embed)
-                    # tar_noc_embed = self.noc_net_tar['map'](tar_noc_embed)
-                    losses['loss_embed'] = self.loss_reg(ret_pos, ret_pos_embed)# + self.loss_reg(tar_pos, tar_pos_embed)
-                    losses['loss_embed'] += self.loss_reg(ret_pos, ret_noc_embed)# + self.loss_reg(tar_pos, tar_noc_embed)
+                    for i in range(self.num_classes):
+                        class_mask = classes == i
+                        if not class_mask.any():
+                            continue
+                        ret_pos_embed, tar_pos_embed = self.joint_net[i]._embed(pos_cads)
+                        losses['loss_embedding_ret'] += self.loss(ret_noc_embed[class_mask][...,i*256:(i+1)*256], ret_pos_embed[class_mask]) #/ class_mask.sum()
+                        losses['loss_embedding_tar'] += self.loss(tar_noc_embed[class_mask][...,i*256:(i+1)*256], tar_pos_embed[class_mask])
 
             else:
                 noc_embed = self.embed_nocs(
@@ -395,7 +363,7 @@ class JointE2EHead(nn.Module):
         elif self.is_voxel:
             return self.cad_net(cad_points.float())
         elif self.cad_mode == 'joint':
-            return self.joint_net(cad_points)
+            return self.joint_net[0](cad_points)
         else:  # Point clouds
             return self.cad_net(cad_points.transpose(-2, -1))
 
@@ -501,44 +469,48 @@ class JointE2EHead(nn.Module):
             cad_ids = [None for _ in scenes]
             params = [None for _ in scenes]
             retrieved_idx = [None for _ in scenes]
-            if 'joint' in self.noc_mode:
+            if 'joint' == self.cad_mode:
                 _reps = noc_points.shape[0]
                 
                 nocs_sampled = noc_points.view(_reps, 3, -1)
-                if self.noc_mode == 'joint+image':
-                    ret_noc_embed = self.noc_net_ret['image'](shape_code)
-                    tar_noc_embed = self.noc_net_tar['image'](shape_code)
-                    # ret_noc_embed, tar_noc_embed = (self.noc_net_ret['map'](ret_noc_embed), self.noc_net_tar['map'](tar_noc_embed))
-                    ret_noc_embed = self.noc_net_ret['map'](ret_noc_embed)
-                else:
+                if not self.noc_mode == 'joint+sep':
                     ret_noc_embed = self.noc_net_ret['pointnet'](noc_points, pred_masks) + self.noc_net_ret['image'](shape_code)
                     tar_noc_embed = self.noc_net_tar['pointnet'](noc_points, pred_masks) + self.noc_net_tar['image'](shape_code)
-                if 'mlp' in self.noc_mode:
-                    ret_noc_embed, tar_noc_embed = (self.noc_net_ret['map'](ret_noc_embed), self.noc_net_tar['map'](tar_noc_embed))
-                # ret_noc_embed = self.noc_net_ret['comp_lat'](torch.cat([self.noc_net_ret['pointnet'](noc_points, pred_masks), self.noc_net_ret['image'](shape_code)], dim=-1))
-                # tar_noc_embed = self.noc_net_tar['comp_lat'](torch.cat([self.noc_net_tar['pointnet'](noc_points, pred_masks), self.noc_net_tar['image'](shape_code)], dim=-1))
-                # ret_noc_embed, tar_noc_embed = self.cad_net._embed(nocs_sampled.transpose(2,1))
-
                 for scene in set(scenes):
                     scene_mask = [scene_ == scene for scene_ in scenes]
-                    scene_noc_embeds = ret_noc_embed[scene_mask]
-                    scene_tar_embeds = tar_noc_embed[scene_mask]
                     scene_classes = pred_classes[scene_mask]
 
-                    # retrieved_idx_scene, cad_ids_scene = self.joint_net._retrieval_inference(scene_noc_embeds, scene_noc_embeds.shape[0])
-                    # if scene_noc_embeds.shape[0] == 1:
-                        # print(scene_noc_embeds.shape[0])
-                    # retrieved_idx_scene = []
-                    # cad_ids_scene = []
-                    # params_scene = []
-                    # for i in range(scene_noc_embeds.shape[0]):
-                    #     _rets, _cads = self.joint_net._retrieval_inference(scene_noc_embeds[i].unsqueeze(0), 1)
-                    #     retrieved_idx_scene.extend(_rets)
-                    #     cad_ids_scene.extend(_cads)
-                    #     params_scene.extend(self.joint_net._deform_inference(scene_tar_embeds[i].unsqueeze(0), _rets))
-
-                    retrieved_idx_scene, cad_ids_scene = self.joint_net._retrieval_inference(scene_noc_embeds, scene_noc_embeds.shape[0])
-                    params_scene = self.joint_net._deform_inference(scene_tar_embeds, retrieved_idx_scene)
+                    cad_ids_scene = [None for _ in scene_classes]
+                    params_scene = [None for _ in scene_classes]
+                    retrieved_idx_scene = [None for _ in scene_classes]
+                    if self.noc_mode == 'joint+sep':
+                        for c_cat in range(self.num_classes):
+                            cat_mask = scene_classes == c_cat
+                            if cat_mask.sum() == 0:
+                                continue
+                            scene_ret_noc_embed = self.noc_net_ret[f'pointnet_{c_cat}'](noc_points[cat_mask], pred_masks[cat_mask]) + self.noc_net_ret[f'image_{c_cat}'](shape_code[cat_mask])
+                            scene_tar_noc_embed = self.noc_net_tar[f'pointnet_{c_cat}'](noc_points[cat_mask], pred_masks[cat_mask]) + self.noc_net_tar[f'image_{c_cat}'](shape_code[cat_mask])
+                            _rets, _cads = self.joint_net[c_cat]._retrieval_inference(scene_ret_noc_embed, scene_ret_noc_embed.shape[0])
+                            _rets_tmp = [_e for _e in _rets]
+                            retrieved_idx_scene = [_rets_tmp.pop(0) if _f else retrieved_idx_scene[i] for i, _f in enumerate(cat_mask)]
+                            cad_ids_scene = [_cads.pop(0) if _f else cad_ids_scene[i] for i, _f in enumerate(cat_mask)]
+                            params_tmp = self.joint_net[c_cat]._deform_inference(scene_tar_noc_embed, _rets)
+                            params_scene = [params_tmp.pop(0) if _f else params_scene[i] for i, _f in enumerate(cat_mask)]
+                    else:
+                        scene_noc_embeds = ret_noc_embed[scene_mask]
+                        scene_tar_embeds = tar_noc_embed[scene_mask]
+                        for c_cat in range(self.num_classes):
+                            cat_mask = scene_classes == c_cat
+                            if not cat_mask.any():
+                                continue
+                            scene_ret_noc_embed = scene_noc_embeds[cat_mask][...,c_cat*256:(c_cat+1)*256]
+                            scene_tar_noc_embed = scene_tar_embeds[cat_mask][...,c_cat*256:(c_cat+1)*256]
+                            _rets, _cads = self.joint_net[c_cat]._retrieval_inference(scene_ret_noc_embed, scene_ret_noc_embed.shape[0])
+                            _rets_tmp = [_e for _e in _rets]
+                            retrieved_idx_scene = [_rets_tmp.pop(0) if _f else retrieved_idx_scene[i] for i, _f in enumerate(cat_mask)]
+                            cad_ids_scene = [_cads.pop(0) if _f else cad_ids_scene[i] for i, _f in enumerate(cat_mask)]
+                            params_tmp = self.joint_net[c_cat]._deform_inference(scene_tar_noc_embed, _rets)
+                            params_scene = [params_tmp.pop(0) if _f else params_scene[i] for i, _f in enumerate(cat_mask)]
                     cad_ids_scene.reverse()
                     params_scene.reverse()
                     retrieved_idx_scene.reverse()

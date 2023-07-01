@@ -25,9 +25,10 @@ Tensor = torch.Tensor
 TensorByClass = Dict[int, Tensor]
 IDByClass = Dict[int, List[Tuple[str, str]]]
 RetrievalResult = Tuple[List[Tuple[str, str]], Tensor]
+Categories = ['chair', 'table', 'storagefurniture', 'display', 'bin']
 
 class JointNet(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, category_id: int = 0, num_sources: int = 522, with_icp=True):
         super().__init__()
         self.has_cads = False
         self.mode = cfg.MODEL.RETRIEVAL_MODE
@@ -39,10 +40,10 @@ class JointNet(nn.Module):
         self.wild_points_by_class: Optional[TensorByClass] = None
         self.wild_ids_by_class: Optional[IDByClass] = None
 
-        filename_pickle = cfg.JOINT_SRC_PKL
+        filename_pickle = cfg.JOINT_SRC_PKL.format(Categories[category_id], num_sources)
         with open(filename_pickle, 'rb') as handle:
             sources = pickle.load(handle)['sources']
-        src_data_fol = cfg.JOINT_SRC_DIR
+        src_data_fol = cfg.JOINT_SRC_DIR.format(Categories[category_id])
         self.MAX_NUM_PARAMS = -1
         self.MAX_NUM_PARTS = -1
         self.ALPHA = 0.1
@@ -53,9 +54,15 @@ class JointNet(nn.Module):
         # self.SOURCE_SIGMAS = torch.autograd.Variable(torch.randn((len(sources),1), dtype=torch.float, device=self.device), requires_grad=True)
         # self.device = 'cuda:0'
         print("Loading joint sources...")
-        with open("/home/karacam/Thesis/joint_learning_retrieval_deformation/shape2part_ext.json", 'r') as f:
+        # with open("/home/karacam/Thesis/joint_learning_retrieval_deformation/shape2part_ext.json", 'r') as f:
+        with open("/home/karacam/Thesis/ROCA/shape2part_ext.json", 'r') as f:
             shape2part = json.load(f)
-        part2shape = dict([(value, key) for key, value in shape2part['chair']['model_names'].items()])
+        
+        part2shape = dict([(value, key) for k in shape2part for key, value in shape2part[k]['model_names'].items()])
+        if category_id == 2:
+            with open("/mnt/noraid/karacam/ThesisData/data/roca_storagefurniture.json", 'r') as f:
+                storagefurniture_ids = json.load(f)
+                storagefurniture_ids = {e[1]:e[0] for e in storagefurniture_ids}
 
         for i in range(len(sources)):
             source_model = sources[i]
@@ -69,7 +76,11 @@ class JointNet(nn.Module):
             curr_source_dict["points"] = points
             curr_source_dict["point_labels"] = point_labels
             curr_source_dict["points_mat"] = points_mat
-            curr_source_dict["model_id"] = (shape2part['chair']['synsetid'], part2shape[str(source_model)])
+            if category_id == 2:
+                shape_id = part2shape[str(source_model)]
+                curr_source_dict["model_id"] = (storagefurniture_ids[shape_id], shape_id)
+            else:
+                curr_source_dict["model_id"] = (shape2part[Categories[category_id]]['synsetid'], part2shape[str(source_model)])
 
             curr_source_dict["constraint_mat"] = constraint_mat
             curr_source_dict["constraint_proj_mat"] = constraint_proj_mat
@@ -115,7 +126,7 @@ class JointNet(nn.Module):
             )
             self.comp_decoder = TargetDecoder(self.TARGET_LATENT_DIM)
 
-        _model = torch.load(cfg.JOINT_MODEL_PATH)
+        _model = torch.load(cfg.JOINT_MODEL_PATH + f"/{Categories[category_id]}{num_sources}{'_icp' if with_icp else ''}/model.pth")
         self.target_encoder.load_state_dict(_model["target_encoder"])
         self.target_encoder.to(self.device)
         self.target_encoder.eval()

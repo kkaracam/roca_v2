@@ -15,7 +15,6 @@ from typing import (
 )
 
 import numpy as np
-from scipy.spatial import cKDTree as KDTree
 import trimesh
 from trimesh.voxel.creation import local_voxelize
 import quaternion  # noqa: F401
@@ -24,7 +23,6 @@ from pandas import DataFrame, read_csv
 from tabulate import tabulate
 import h5py
 from tqdm import tqdm
-from point_cloud_utils import pairwise_distances, sinkhorn, earth_movers_distance
 from roca.data import CADCatalog
 
 from detectron2.data import MetadataCatalog
@@ -43,12 +41,13 @@ from roca.utils.alignment_errors import (
     scale_ratio,
     translation_diff,
 )
-from roca.utils.linalg import decompose_mat4, make_M_from_tqs
+from roca.utils.linalg import decompose_mat4, make_M_from_tqs, transform_mesh
 from roca.utils.ap import compare_meshes
-from roca.modeling.retrieval_head.joint_retrieve_deform_ops import get_model
+from roca.modeling.retrieval_head.joint_retrieve_deform_ops import get_model, get_source_info_mesh, get_shape_numpy
 
 from PIL import Image
 from pytorch3d.io import load_obj
+from pytorch3d.ops import sample_points_from_meshes
 from pytorch3d.structures import Meshes, Pointclouds
 # from pytorch3d.transforms import RotateAxisAngle
 from pytorch3d.renderer import(
@@ -72,7 +71,7 @@ NMS_TRANS = 0.4
 NMS_ROT = 60
 NMS_SCALE = 0.6
 
-TRANS_THRESH = 0.2
+TRANS_THRESH = 0.3
 ROT_THRESH = 20
 SCALE_THRESH = 0.2
 VOXEL_IOU_THRESH = 0.5
@@ -104,6 +103,10 @@ class Vid2CADEvaluator(DatasetEvaluator):
 
         self._exclude = exclude
 
+        self.DEFORM = True
+        CAD_TAXONOMY[90000000] = 'storagefurniture'
+        CAD_TAXONOMY_REVERSE['storagefurniture'] = 90000000
+
         # Parse raw data
         if isinstance(full_annot, list):
             annots = full_annot
@@ -122,9 +125,12 @@ class Vid2CADEvaluator(DatasetEvaluator):
             ))
             alignment = []
             for model in annot['aligned_models']:
-                if int(model['catid_cad']) not in CAD_TAXONOMY:
+                model_catid_cad = int(model['catid_cad'])
+                if CAD_TAXONOMY[int(model['catid_cad'])] == 'bookcase' or CAD_TAXONOMY[int(model['catid_cad'])] == 'cabinet':
+                    model_catid_cad = CAD_TAXONOMY_REVERSE['storagefurniture']
+                if model_catid_cad not in CAD_TAXONOMY:
                     continue
-                scene_counts[scene][int(model['catid_cad'])] += 1
+                scene_counts[scene][model_catid_cad] += 1
                 mtrs = model['trs']
                 to_s2c = make_M_from_tqs(
                     mtrs['translation'],
@@ -145,8 +151,9 @@ class Vid2CADEvaluator(DatasetEvaluator):
         self._scene_alignments = scene_alignments
         self._scene_counts = scene_counts
 
-        with open(self._metadata.ret_lookup, 'r') as f:
-            self.ret_lookup = json.load(f)
+        with open("/mnt/noraid/karacam/ThesisData/data/roca_storagefurniture.json", 'r') as f:
+            storagefurniture_ids = json.load(f)
+            self.storagefurniture_ids = {e[1]:e[0] for e in storagefurniture_ids}
 
         self.with_grids = grid_file is not None
         self.grid_data = None
@@ -165,29 +172,32 @@ class Vid2CADEvaluator(DatasetEvaluator):
         self.key_prefix = key_prefix
         self.info_file = info_file
 
-        filename_pickle = cfg.JOINT_SRC_PKL
-        with open(filename_pickle, 'rb') as handle:
-            sources = pkl.load(handle)['sources']
-        self.src_data_fol = cfg.JOINT_SRC_DIR
-        with open("/home/karacam/Thesis/joint_learning_retrieval_deformation/shape2part_ext.json", 'r') as f:
-            self.shape2part = json.load(f)
-        part2shape = dict([(value, key) for key, value in self.shape2part['chair']['model_names'].items()])
+        with open("/home/karacam/Thesis/ROCA/shape2part_ext.json", 'r') as f:
+            shape2part = json.load(f)
+        part2shape = dict([(value, key) for k in shape2part for key, value in shape2part[k]['model_names'].items()])
         self.source_info = {}
         self._metas = {}
-        with open(f"/mnt/noraid/karacam/Roca/Data/Dataset/Custom25k/train_grids_32.pkl", 'rb') as f:
+        with open(f"/mnt/noraid/karacam/Roca/Data/Dataset/Custom3Class/train_grids_32.pkl", 'rb') as f:
             self.train_grids = pkl.load(f)
-        # print("Loading source mesh info...")
-        # if not src_info:
-        #     for src in sources:
-        #         src_filename = str(src) + "_leaves.h5"
-        #         shapeid = part2shape[str(src)]
-        #         self.source_info[shapeid] = (get_model(os.path.join(self.src_data_fol, src_filename), pred=True))
-        #         with open(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{shapeid}/models/model_normalized.json", 'r') as jf:
-        #             _meta = json.load(jf)
-        #         self._metas[shapeid] = _meta
-        # else:
-        #     self.source_info = src_info
-        # print("Done.")
+        if self.DEFORM:
+            if not src_info:
+                for i, _num_s in zip([0,1,2,3,4], [522,676,306,138,79]):
+                    c_name = self._category_manager.get_name(i)
+                    filename_pickle = cfg.JOINT_SRC_PKL.format(c_name, _num_s)
+                    with open(filename_pickle, 'rb') as handle:
+                        sources = pkl.load(handle)['sources']
+                    self.src_data_fol = cfg.JOINT_SRC_DIR.format(c_name)
+                    print("Loading source mesh info...")
+                    for src in sources:
+                        src_filename = str(src) + "_leaves.h5"
+                        shapeid = part2shape[str(src)]
+                        self.source_info[shapeid] = (get_model(os.path.join(self.src_data_fol, src_filename), pred=True))
+                        # with open(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{shapeid}/models/model_normalized.json", 'r') as jf:
+                        #     _meta = json.load(jf)
+                        # self._metas[shapeid] = _meta
+            else:
+                self.source_info = src_info
+            print("Done.")
         self.noc_tar_trip = []
 
     def reset(self):
@@ -220,7 +230,14 @@ class Vid2CADEvaluator(DatasetEvaluator):
                 instances.remove('pred_meshes')
             self.results[scene_name].append(instances.to('cpu'))
 
-            if 'cad_ids' in output:
+            if 'wild_cad_ids' in output:
+                object_ids = output['wild_cad_ids']
+                object_ids = [
+                    object_ids[i]
+                    for i in instances.pred_indices.tolist()
+                ]
+                self.object_ids[scene_name].append(object_ids)
+            elif 'cad_ids' in output:
                 object_ids = output['cad_ids']
                 object_ids = [
                     object_ids[i]
@@ -351,7 +368,9 @@ class Vid2CADEvaluator(DatasetEvaluator):
         for scene, instances in results:
             data['id_scan'].extend((scene,) * len(instances))
             for c in instances.pred_classes.tolist():
-                cid = CAD_TAXONOMY_REVERSE[self._category_manager.get_name(c)]
+                c_name = self._category_manager.get_name(c)
+                cid = CAD_TAXONOMY_REVERSE[c_name]
+                # cid = CAD_TAXONOMY_REVERSE[c_name] if not c_name == 'storagefurniture' else c
                 data['objectCategory'].append(cid)
 
             data['alignedModelId'].extend(
@@ -404,21 +423,21 @@ class Vid2CADEvaluator(DatasetEvaluator):
                 if pred_classes[j] != pred_classes[i]:
                     continue
 
-                object_ids = self.object_ids[scene]
-                if self.mocking:
-                    cat_i = pred_classes[i]
-                    model_i = object_ids[instances.model_indices[i].item()]
-                else:
-                    cat_i, model_i = object_ids[i]
-                try:
-                    sym = next(
-                        a['sym']
-                        for a in self._scene_alignments[scene]
-                        if int(a['catid_cad']) == int(cat_i)
-                        and a['id_cad'] == model_i
-                    )
-                except StopIteration:
-                    sym = "__SYM_NONE"
+                # object_ids = self.object_ids[scene]
+                # if self.mocking:
+                #     cat_i = pred_classes[i]
+                #     model_i = object_ids[instances.model_indices[i].item()]
+                # else:
+                #     cat_i, model_i = object_ids[i]
+                # try:
+                #     sym = next(
+                #         a['sym']
+                #         for a in self._scene_alignments[scene]
+                #         if int(a['catid_cad']) == int(cat_i)
+                #         and a['id_cad'] == model_i
+                #     )
+                # except StopIteration:
+                #     sym = "__SYM_NONE"
                     # print("StopIteration encountered")
 
                 # is_dup = (
@@ -445,8 +464,13 @@ class Vid2CADEvaluator(DatasetEvaluator):
             pred_counts = Counter()
             mask = torch.ones(len(instances), dtype=torch.bool)
             for i, catid in enumerate(instances.pred_classes.tolist()):
-                cid = CAD_TAXONOMY_REVERSE[self._category_manager.get_name(catid)]
-                if pred_counts[catid] >= gt_counts[cid]:
+                c_name = self._category_manager.get_name(catid)
+                # if c_name == 'storagefurniture':
+                #     _gt_counts = gt_counts[CAD_TAXONOMY_REVERSE[c_name][0]] + gt_counts[CAD_TAXONOMY_REVERSE[c_name][1]]
+                # else:
+                cid = CAD_TAXONOMY_REVERSE[c_name]
+                _gt_counts = gt_counts[cid]
+                if pred_counts[catid] >= _gt_counts:
                     mask[i] = False
                 else:
                     pred_counts[catid] += 1
@@ -561,18 +585,19 @@ class Vid2CADEvaluator(DatasetEvaluator):
         #     else:
         #         label_counts[int(label['catid_cad'])] += 1
         for label in labels:
-            label_counts[int(label['catid_cad'])] += 1
+            label_cid = label['catid_cad'] if label['id_cad'] not in self.storagefurniture_ids else '90000000'
+            label_counts[int(label_cid)] += 1
 
         corrects = Counter()
         covered = [False for _ in labels]
-        max_f1s = [-1. for _ in labels]
-        not_in_trains = [(l['catid_cad'], l['id_cad']) in set(self.train_grids.keys()) for l in labels]
+        # max_f1s = [-1. for _ in labels]
+        # not_in_trains = [(l['catid_cad'], l['id_cad']) in set(self.train_grids.keys()) for l in labels]
         for i in range(len(instances)):
             pred_trans = instances.pred_translations[i]
             pred_rot = np.quaternion(*instances.pred_rotations[i].tolist())
             pred_scale = instances.pred_scales[i]
             pred_class = instances.pred_classes[i].item()
-
+            c_name = self._category_manager.get_name(pred_class)
             object_ids = self.object_ids[scene]
             if self.object_params:
                 object_params = self.object_params[scene]
@@ -597,34 +622,44 @@ class Vid2CADEvaluator(DatasetEvaluator):
             #     sym_i = "__SYM_NONE"
                 # print("StopIteration encountered")
             if not self.exact_ret:
-                # default_param, vertices_mat, faces, constraint_proj_mat = self.source_info[model_i]
-                # curr_param = np.expand_dims(pred_params, -1)
-                # curr_mat, curr_default_param, curr_conn_mat = get_source_info_mesh(vertices_mat, default_param, constraint_proj_mat, curr_param.shape[0])
-                # output_vertices = get_shape_numpy(curr_mat, curr_param, curr_default_param.T, connectivity_mat=curr_conn_mat)
-                # pred_mesh = Meshes([torch.from_numpy(output_vertices).type(torch.float)], [torch.from_numpy(faces).type(torch.float)]).to('cuda')
-                # mesh = trimesh.Trimesh(
-                #     vertices=output_vertices,
-                #     faces=faces
-                # )
+                if self.DEFORM:
+                    default_param, vertices_mat, faces, constraint_proj_mat = self.source_info[model_i]
+                    curr_param = np.array(pred_params, copy=True)
+                    curr_param = np.expand_dims(curr_param, -1)
+                    curr_mat, curr_default_param, curr_conn_mat = get_source_info_mesh(vertices_mat, default_param, constraint_proj_mat, curr_param.shape[0])
+                    output_vertices = get_shape_numpy(curr_mat, curr_param, curr_default_param.T, connectivity_mat=curr_conn_mat)
+                    pred_mesh = Meshes([torch.from_numpy(output_vertices).type(torch.float)], [torch.from_numpy(faces).type(torch.float)])#.to('cuda')
+                    # pred_mesh = trimesh.Trimesh(
+                    #     vertices=output_vertices,
+                    #     faces=faces
+                    # )
+                    # pred_verts_idx = fps(torch.from_numpy(output_vertices).to('cuda'), ratio=1024/output_vertices.shape[0], random_start=False)
+                    # pred_verts = output_vertices[pred_verts_idx.cpu().numpy()]
+                    # pred_verts = pred_mesh.sample(1024)
 
-                # diag = np.asarray(self._metas[model_i]['max']) - np.asarray(self._metas[model_i]['min'])
-                # center = (np.asarray(self._metas[model_i]['max']) + np.asarray(self._metas[model_i]['min']))/2
-                # mesh.vertices = mesh.vertices + (center - np.asarray(self._metas[model_i]['centroid'])) / np.linalg.norm(diag)
-                # pred_ind = voxelize_mesh(mesh)
-                
-                pred_mesh = self.cad_manager_train.model_by_id(cat_i, model_i).to('cuda')
-                # pred_ind = self.train_grids[cat_i, model_i]
-                
-                # pred_mesh = self.cad_manager.model_by_id(cat_i, model_i).to('cuda')
-                # pred_ind = self.val_grid_data[cat_i, model_i]
-            
+                else:
+                    pred_mesh = self.cad_manager_train.model_by_id(cat_i, model_i)
+                    # pred_mesh = trimesh.Trimesh(
+                    #     vertices=pred_mesh.verts_list()[0].cpu().numpy(),
+                    #     faces=pred_mesh.faces_list()[0].cpu().numpy()
+                    # )
+                    # pred_verts_idx = fps(torch.from_numpy(pred_mesh.vertices).to('cuda'), ratio=1024/pred_mesh.vertices.shape[0], random_start=False)
+                    # pred_verts = pred_mesh.vertices[pred_verts_idx.cpu().numpy()]
+                    # pred_verts = pred_mesh.sample(1024)
+                    # pred_verts = self.cad_manager_train._points[0][cat_i, model_i].cpu().numpy()
+                pred_mesh_transformed = transform_mesh(pred_mesh, pred_trans.cpu(), pred_rot, pred_scale.cpu())
             match = None
             for j, label in enumerate(labels):
                 if covered[j]:
                     continue
                 gt_class = (
                     label['catid_cad']
-                )
+                ) if label['id_cad'] not in self.storagefurniture_ids else '90000000'
+                # if c_name == 'storagefurniture':
+                #     print(c_name, gt_class)
+                #     print(CAD_TAXONOMY_REVERSE[c_name])
+                # if c_name == 'storagefurniture' and gt_class not in CAD_TAXONOMY_REVERSE[c_name]:
+                #     continue
                 if self._category_manager.get_name(pred_class) != CAD_TAXONOMY[int(gt_class)]:
                     continue
 
@@ -653,17 +688,7 @@ class Vid2CADEvaluator(DatasetEvaluator):
                 #     trimesh.PointCloud(nocs_comp[1].T).export('tst_nocs.ply')
                 #     exit()
                 #     self.noc_tar_trip.append((pred_mesh, nocs_comp[1], label['id_cad']))
-                    
-                # for k, ret_label in enumerate(ret_labels):
-                #     if ret_covered[k]:
-                #         continue
 
-                #     cad_pred = (int(cat_i), model_i)
-                #     # cad_gt = (int(ret_label[0][0]), ret_label[0][1])
-                #     # is_correct = is_correct and cad_pred == cad_gt
-
-                #     cad_gts = [(int(rl[0]), rl[1]) for rl in ret_label]
-                #     is_correct = is_correct and (cad_pred in cad_gts)
                 if self.exact_ret:
                     cad_pred = (int(cat_i), model_i)
                     cad_gt = (int(label['catid_cad']), label['id_cad'])
@@ -676,30 +701,41 @@ class Vid2CADEvaluator(DatasetEvaluator):
                         # if iou >= 0.4:
                         # print(iou)
                         # print('Passed')
-                        gt_mesh = self.cad_manager.model_by_id(label['catid_cad'], label['id_cad']).to('cuda')
-                        metrics = compare_meshes(pred_mesh, gt_mesh)
+                        gt_mesh = self.cad_manager.model_by_id(label['catid_cad'], label['id_cad'])
+                        # metrics = compare_meshes(pred_mesh, gt_mesh, thresholds=[0.3])
+                        metrics = compare_meshes(
+                            pred_mesh_transformed.to('cuda'), 
+                            transform_mesh(gt_mesh, gt_trans, gt_rot, gt_scale).to('cuda'), 
+                            thresholds=[0.5],
+                            # scale='gt-1'
+                        )
                         f1_score = metrics['F1@0.500000']
+
+                        # gt_mesh = trimesh.Trimesh(
+                        #     vertices=gt_mesh.verts_list()[0],
+                        #     faces=gt_mesh.faces_list()[0]
+                        # )
+                        # gt_verts = self.cad_manager._points[0][label['catid_cad'], label['id_cad']].cpu().numpy()
+                        # gt_verts = fps(gt_mesh.vertices, ratio=2048/gt_mesh.vertices.shape[0])
+                        # gt_verts = gt_mesh.sample(10000)
+                        # pred_verts = self.cad_manager_train._points[0][cat_i, model_i].cpu().numpy()
+                        # pred_verts,_,_ = trimesh.proximity.closest_point(pred_mesh, pred_verts)
+                        # emd_score = emd(pred_verts, gt_verts)
                     except KeyError:
                         iou = 0.0
                         print('failed')
                     # is_correct = is_correct and iou >= VOXEL_IOU_THRESH
-                    is_correct = is_correct and f1_score >= 80.
+                    # is_correct = is_correct and f1_score >= 50.
+                    is_correct = f1_score >= 50.
+                    # is_correct = is_correct and emd_score <= 0.065
                 
                 # if is_correct and not self.exact_ret:
-                #     self.noc_tar_trip.append((pred_mesh.cpu(), nocs_comp[1].transpose(0,1), label['id_cad']))
-                #     # mesh = trimesh.load(f"/mnt/noraid/karacam/ShapeNetCore.v2/03001627/{model_i}/models/model_normalized.obj", force='mesh')
-                #     pred_mesh = trimesh.Trimesh(pred_mesh.verts_list()[0].cpu().numpy(), pred_mesh.faces_list()[0].cpu().numpy())
-                #     pred_mesh.export('tst_pred.obj')
-                #     deform_mesh = trimesh.Trimesh(deform_mesh.verts_list()[0].cpu().numpy(), deform_mesh.faces_list()[0].cpu().numpy())
-                #     deform_mesh.export('tst_deformed.obj')
-                #     # trimesh.Trimesh(gt_mesh.verts_list()[0].cpu().numpy(), gt_mesh.faces_list()[0].cpu().numpy()).export('tst_tar.obj')
-                #     trimesh.PointCloud(nocs_comp[1].T).export('tst_nocs.ply')
-                #     # print(pred_mesh.bounds)
-                #     # print(deform_mesh.bounds)
-                #     exit()
+                #     pred_verts = sample_points_from_meshes(pred_mesh, 1024).cpu().numpy()[0]
+                #     gt_verts = sample_points_from_meshes(gt_mesh, 1024).cpu().numpy()[0]
+                #     emd_scores[int(label['catid_cad'])] += emd(pred_verts, gt_verts)
 
                 if is_correct:
-                    corrects[int(label['catid_cad'])] += 1
+                    corrects[int(gt_class)] += 1
                     covered[j] = True
                     # ret_covered[k] = True
                     match = {'index': j, 'label': label}
@@ -810,42 +846,6 @@ def eval_csv(
         evaluator.process_mock(scene, instances, model_list)
 
     return evaluator.evaluate_mock()
-
-def get_source_info_mesh(points_mat, default_param, constraint_proj_mat, max_num_params, use_connectivity=True):
-    padded_mat = np.zeros((points_mat.shape[0], max_num_params))
-    padded_mat[0:points_mat.shape[0], 0:points_mat.shape[1]] = points_mat
-    # padded_mat = np.expand_dims(padded_mat, axis=0)
-
-    padded_default_param = np.zeros(max_num_params)
-    padded_default_param[:default_param.shape[0]] = default_param
-    padded_default_param = np.expand_dims(padded_default_param, axis=0)
-
-    constraint_padded_mat = np.zeros((max_num_params, max_num_params))
-    constraint_padded_mat[0:constraint_proj_mat.shape[0], 0:constraint_proj_mat.shape[1]] = constraint_proj_mat	
-
-    return padded_mat.astype("float"), padded_default_param.astype("float"), constraint_padded_mat.astype("float")
-
-def get_shape_numpy(A, param, src_default_param=None, weight=0.1, connectivity_mat = None):
-    ### A is the parametric model of the shape
-    ### assumes that the shape of A and param agree
-    param = np.multiply(param, weight)
-
-    if (src_default_param is None):
-        param = param
-    else:
-        param = param + src_default_param
-
-    # For connectivity
-    if connectivity_mat is None:
-        param = param
-
-    else:
-        # print("Using connectivity constraint for mesh generation.")
-        param = np.matmul(connectivity_mat, param)
-
-    pc = np.reshape(np.matmul(A, param), (-1, 3), order='C')
-
-    return pc
 
 def create_grid_points_from_xyz_bounds(min_x, max_x, min_y, max_y ,min_z, max_z, res):
     x = np.linspace(min_x, max_x, res)
@@ -965,3 +965,11 @@ def render_nocs(noc_trips):
     grid.save(out_path)
     grid.close()
     for img in to_grid_imgs: img.close()
+
+from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
+
+def emd(p,q):
+    d = cdist(p, q)
+    assignment = linear_sum_assignment(d)
+    return d[assignment].sum() / min(len(p), len(q))

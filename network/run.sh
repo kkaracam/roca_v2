@@ -22,6 +22,7 @@ python main.py \
     --retrieval_mode $RETRIEVAL_MODE \
     --retrieval_loss $RETRIEVAL_LOSS \
     --joint_model_path $JOINT_MODEL_PATH \
+    --joint_with_icp $JOINT_WITH_ICP \
     --e2e $E2E \
     --seed $SEED \
     --batch_size 2
